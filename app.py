@@ -1,9 +1,23 @@
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 #  Question Difficulty Ranker  —  Adaptive Comparative Judgement (ACJ)
-#  Backend: Google Sheets   |   Hosting: Streamlit Community Cloud
+#  Backend: Supabase   |   Hosting: Streamlit Community Cloud
 #
-#  See DEPLOY.txt for full setup instructions.
-# ─────────────────────────────────────────────────────────────────────────────
+#  Secrets required (paste into Streamlit Cloud → App Settings → Secrets):
+#
+#  [supabase]
+#  url = "https://xxxx.supabase.co"
+#  key = "your-anon-key"
+#
+#  Supabase table (run once in the Supabase SQL editor):
+#
+#  create table comparisons (
+#    id         text primary key,
+#    judge_name text not null,
+#    winner_id  text not null,
+#    loser_id   text not null,
+#    created_at text not null
+#  );
+# ───────────────────────────────────────────────────────────────────────────────
 
 import os
 import random
@@ -12,10 +26,9 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-import gspread
-from google.oauth2.service_account import Credentials
+from supabase import create_client, Client
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ─── Configuration ───────────────────────────────────────────────────────────────────────────
 
 IMAGES_DIR = "images"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
@@ -23,62 +36,52 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 # Comparisons per judge: 4 judges × 500 = 2,000 total ≈ 8 per question (250 Qs)
 TARGET_PER_JUDGE = 500
 
-SHEET_HEADERS = ["id", "judge_name", "winner_id", "loser_id", "created_at"]
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+TABLE_NAME = "comparisons"
 
 
-# ─── Google Sheets connection ──────────────────────────────────────────────────
+# ─── Supabase connection ───────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
-def get_worksheet():
-    """
-    Authenticate with the Google service account stored in Streamlit secrets
-    and return the first worksheet of the configured spreadsheet.
-    Cached as a resource so the connection is reused across sessions.
-    """
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=SCOPES
+def get_client() -> Client:
+    """Create and cache the Supabase client. Reused across all sessions."""
+    return create_client(
+        st.secrets["supabase"]["url"],
+        st.secrets["supabase"]["key"],
     )
-    client = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(st.secrets["google_sheets"]["spreadsheet_id"])
-    return spreadsheet.sheet1
 
 
-def init_sheet():
-    """Add header row if the sheet is empty."""
-    ws = get_worksheet()
-    existing = ws.row_values(1)
-    if existing != SHEET_HEADERS:
-        ws.clear()
-        ws.append_row(SHEET_HEADERS)
-
-
-# ─── Data access ───────────────────────────────────────────────────────────────
+# ─── Data access ──────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=20)
 def load_comparisons() -> pd.DataFrame:
     """
-    Read all comparisons from Google Sheets.
-    Cached for 20 seconds to reduce API calls — safe because we manually
-    invalidate the cache immediately after writing.
+    Read all comparisons from Supabase.
+    Cached for 20 seconds to reduce API calls — manually invalidated after writes.
     """
-    ws = get_worksheet()
-    records = ws.get_all_records()
-    if not records:
-        return pd.DataFrame(columns=SHEET_HEADERS)
-    return pd.DataFrame(records)
+    client = get_client()
+    response = client.table(TABLE_NAME).select("*").execute()
+    data = response.data
+    if not data:
+        return pd.DataFrame(
+            columns=["id", "judge_name", "winner_id", "loser_id", "created_at"]
+        )
+    return pd.DataFrame(data)
 
 
 def save_comparison(judge_name: str, winner_id: str, loser_id: str):
-    """Append a comparison row and immediately invalidate the read cache."""
-    ws = get_worksheet()
+    """Insert a comparison row and immediately invalidate the read cache."""
+    client = get_client()
     row_id = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
     timestamp = datetime.datetime.utcnow().isoformat()
-    ws.append_row([row_id, judge_name, winner_id, loser_id, timestamp])
+    client.table(TABLE_NAME).insert(
+        {
+            "id": row_id,
+            "judge_name": judge_name,
+            "winner_id": winner_id,
+            "loser_id": loser_id,
+            "created_at": timestamp,
+        }
+    ).execute()
     # Invalidate cached data so the next read reflects this write
     load_comparisons.clear()
 
@@ -90,7 +93,7 @@ def count_judge_comparisons(judge_name: str) -> int:
     return int((df["judge_name"] == judge_name).sum())
 
 
-# ─── Question loading ──────────────────────────────────────────────────────────
+# ─── Question loading ──────────────────────────────────────────────────────────────────────────
 
 @st.cache_data
 def load_question_ids() -> list:
@@ -112,7 +115,7 @@ def get_image_path(question_id: str):
     return None
 
 
-# ─── Bradley-Terry ranking ─────────────────────────────────────────────────────
+# ─── Bradley-Terry ranking ─────────────────────────────────────────────────────────────────────────
 
 def compute_rankings(question_ids: list) -> tuple:
     """
@@ -164,7 +167,7 @@ def compute_rankings(question_ids: list) -> tuple:
     return scores, comp_counts
 
 
-# ─── Adaptive pair selection ────────────────────────────────────────────────────
+# ─── Adaptive pair selection ────────────────────────────────────────────────────────────────────────────
 
 def select_next_pair(question_ids: list, judge_name: str, scores: dict) -> tuple:
     """
@@ -210,7 +213,7 @@ def select_next_pair(question_ids: list, judge_name: str, scores: dict) -> tuple
     return chosen if random.random() < 0.5 else (chosen[1], chosen[0])
 
 
-# ─── Page: Judging ──────────────────────────────────────────────────────────────
+# ─── Page: Judging ──────────────────────────────────────────────────────────────────────────────────
 
 def page_judging(question_ids: list):
     st.title("Question Difficulty Ranking")
@@ -222,7 +225,7 @@ def page_judging(question_ids: list):
         )
         return
 
-    # ── Login ──────────────────────────────────────────────────────────────────
+    # ── Login ───────────────────────────────────────────────────────────────────────────
     if not st.session_state.get("judge_name"):
         st.markdown("### Welcome")
         st.markdown(
@@ -240,7 +243,7 @@ def page_judging(question_ids: list):
     judge = st.session_state["judge_name"]
     done = count_judge_comparisons(judge)
 
-    # ── Sidebar status ─────────────────────────────────────────────────────────
+    # ── Sidebar status ──────────────────────────────────────────────────────────────────────
     st.sidebar.markdown(f"**Judge:** {judge}")
     st.sidebar.markdown(f"**Comparisons made:** {done} / {TARGET_PER_JUDGE}")
     st.sidebar.progress(min(done / TARGET_PER_JUDGE, 1.0))
@@ -258,7 +261,7 @@ def page_judging(question_ids: list):
         f"Target: {TARGET_PER_JUDGE} comparisons per judge."
     )
 
-    # ── Select next pair ───────────────────────────────────────────────────────
+    # ── Select next pair ───────────────────────────────────────────────────────────────────────
     if "current_pair" not in st.session_state:
         scores, _ = compute_rankings(question_ids) if done >= 20 else ({}, {})
         st.session_state["current_pair"] = select_next_pair(
@@ -267,7 +270,7 @@ def page_judging(question_ids: list):
 
     q_left, q_right = st.session_state["current_pair"]
 
-    # ── Comparison UI ──────────────────────────────────────────────────────────
+    # ── Comparison UI ──────────────────────────────────────────────────────────────────────────
     st.subheader("Which question is more difficult?")
     st.caption("Click the button **below** the question you think is harder.")
     st.markdown("---")
@@ -312,7 +315,7 @@ def page_judging(question_ids: list):
         st.rerun()
 
 
-# ─── Page: Results ──────────────────────────────────────────────────────────────
+# ─── Page: Results ──────────────────────────────────────────────────────────────────────────────────
 
 def page_results(question_ids: list):
     st.title("Difficulty Rankings")
@@ -336,7 +339,7 @@ def page_results(question_ids: list):
         st.info("Not enough comparisons yet — complete a few more rounds first.")
         return
 
-    # ── Rankings table ─────────────────────────────────────────────────────────
+    # ── Rankings table ──────────────────────────────────────────────────────────────────────
     sorted_qs = sorted(scores, key=lambda q: scores[q], reverse=True)
 
     results_df = pd.DataFrame(
@@ -366,7 +369,7 @@ def page_results(question_ids: list):
         mime="text/csv",
     )
 
-    # ── Per-judge breakdown ────────────────────────────────────────────────────
+    # ── Per-judge breakdown ──────────────────────────────────────────────────────────────────────────
     st.subheader("Comparisons per Judge")
     judge_counts = (
         df.groupby("judge_name")
@@ -386,7 +389,7 @@ def page_results(question_ids: list):
         )
 
 
-# ─── Main ──────────────────────────────────────────────────────────────────────
+# ─── Main ──────────────────────────────────────────────────────────────────────────────────────
 
 def main():
     st.set_page_config(
@@ -397,10 +400,10 @@ def main():
     )
 
     try:
-        init_sheet()
+        get_client()
     except Exception as e:
         st.error(
-            "Could not connect to Google Sheets. "
+            "Could not connect to Supabase. "
             "Check that your secrets are configured correctly in Streamlit Cloud. "
             f"Error: {e}"
         )
