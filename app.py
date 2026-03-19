@@ -8,7 +8,7 @@
 #  url = "https://xxxx.supabase.co"
 #  key = "your-anon-key"
 #
-#  Supabase table (run once in the Supabase SQL editor):
+#  Supabase tables (run once in the Supabase SQL editor):
 #
 #  create table comparisons (
 #    id         text primary key,
@@ -17,30 +17,29 @@
 #    loser_id   text not null,
 #    created_at text not null
 #  );
+#
+#  create table flags (
+#    id         text primary key,
+#    judge_name text not null,
+#    item_id    text not null,
+#    created_at text not null
+#  );
 # ───────────────────────────────────────────────────────────────────────────────
-
 import os
 import random
 import datetime
 from pathlib import Path
-
 import pandas as pd
 import streamlit as st
 from supabase import create_client, Client
-
 # ─── Configuration ───────────────────────────────────────────────────────────────────────────
-
 IMAGES_DIR = "images"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
-
 # Comparisons per judge: 4 judges × 500 = 2,000 total ≈ 8 per question (250 Qs)
 TARGET_PER_JUDGE = 500
-
 TABLE_NAME = "comparisons"
-
-
+FLAGS_TABLE_NAME = "flags"
 # ─── Supabase connection ───────────────────────────────────────────────────────────────────────────
-
 @st.cache_resource
 def get_client() -> Client:
     """Create and cache the Supabase client. Reused across all sessions."""
@@ -48,10 +47,7 @@ def get_client() -> Client:
         st.secrets["supabase"]["url"],
         st.secrets["supabase"]["key"],
     )
-
-
-# ─── Data access ──────────────────────────────────────────────────────────────────────────────
-
+# ─── Data access — comparisons ────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=20)
 def load_comparisons() -> pd.DataFrame:
     """
@@ -66,8 +62,6 @@ def load_comparisons() -> pd.DataFrame:
             columns=["id", "judge_name", "winner_id", "loser_id", "created_at"]
         )
     return pd.DataFrame(data)
-
-
 def save_comparison(judge_name: str, winner_id: str, loser_id: str):
     """Insert a comparison row and immediately invalidate the read cache."""
     client = get_client()
@@ -84,17 +78,51 @@ def save_comparison(judge_name: str, winner_id: str, loser_id: str):
     ).execute()
     # Invalidate cached data so the next read reflects this write
     load_comparisons.clear()
-
-
 def count_judge_comparisons(judge_name: str) -> int:
     df = load_comparisons()
     if df.empty:
         return 0
     return int((df["judge_name"] == judge_name).sum())
-
-
+# ─── Data access — flags ─────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=30)
+def load_flags() -> pd.DataFrame:
+    """
+    Read all flags from Supabase.
+    Cached for 30 seconds — manually invalidated after writes.
+    """
+    client = get_client()
+    response = client.table(FLAGS_TABLE_NAME).select("*").execute()
+    data = response.data
+    if not data:
+        return pd.DataFrame(
+            columns=["id", "judge_name", "item_id", "created_at"]
+        )
+    return pd.DataFrame(data)
+def save_flag(judge_name: str, item_id: str) -> bool:
+    """
+    Flag an item as potentially incorrect.
+    Returns True if saved, False if this judge has already flagged this item.
+    Each (judge_name, item_id) pair is stored at most once.
+    """
+    df = load_flags()
+    if not df.empty:
+        already = ((df["judge_name"] == judge_name) & (df["item_id"] == item_id)).any()
+        if already:
+            return False
+    client = get_client()
+    row_id = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S%f") + "_flag"
+    timestamp = datetime.datetime.utcnow().isoformat()
+    client.table(FLAGS_TABLE_NAME).insert(
+        {
+            "id": row_id,
+            "judge_name": judge_name,
+            "item_id": item_id,
+            "created_at": timestamp,
+        }
+    ).execute()
+    load_flags.clear()
+    return True
 # ─── Question loading ──────────────────────────────────────────────────────────────────────────
-
 @st.cache_data
 def load_question_ids() -> list:
     """Scan the images folder; filename stem = question ID."""
@@ -105,18 +133,13 @@ def load_question_ids() -> list:
         for p in Path(IMAGES_DIR).iterdir()
         if p.suffix.lower() in IMAGE_EXTENSIONS
     )
-
-
 def get_image_path(question_id: str):
     for ext in IMAGE_EXTENSIONS:
         path = Path(IMAGES_DIR) / f"{question_id}{ext}"
         if path.exists():
             return str(path)
     return None
-
-
-# ─── Bradley-Terry ranking ─────────────────────────────────────────────────────────────────────────
-
+# ─── Bradley-Terry ranking ────────────────────────────────────────────────────────────────────────
 def compute_rankings(question_ids: list) -> tuple:
     """
     Returns (scores_dict, comp_counts_dict).
@@ -124,22 +147,17 @@ def compute_rankings(question_ids: list) -> tuple:
     falls back to normalised win-rate if not.
     """
     df = load_comparisons()
-
     comp_counts = {q: 0 for q in question_ids}
     if df.empty:
         return {q: 0.0 for q in question_ids}, comp_counts
-
     q_set = set(question_ids)
     df = df[df["winner_id"].isin(q_set) & df["loser_id"].isin(q_set)]
-
     for q in question_ids:
         comp_counts[q] = int(
             ((df["winner_id"] == q) | (df["loser_id"] == q)).sum()
         )
-
     try:
         import choix
-
         q_list = sorted(question_ids)
         idx = {q: i for i, q in enumerate(q_list)}
         data = [
@@ -151,7 +169,6 @@ def compute_rankings(question_ids: list) -> tuple:
             raise ValueError("Not enough data for BT model yet.")
         params = choix.ilsr_pairwise(len(q_list), data, alpha=0.01)
         scores = {q_list[i]: float(params[i]) for i in range(len(q_list))}
-
     except Exception:
         # Fallback: normalised win rate
         wins = {q: 0 for q in question_ids}
@@ -163,12 +180,8 @@ def compute_rankings(question_ids: list) -> tuple:
             if r.loser_id in wins:
                 total[r.loser_id] += 1
         scores = {q: wins[q] / max(total[q], 1) for q in question_ids}
-
     return scores, comp_counts
-
-
-# ─── Adaptive pair selection ────────────────────────────────────────────────────────────────────────────
-
+# ─── Adaptive pair selection ──────────────────────────────────────────────────────────────────────
 def select_next_pair(question_ids: list, judge_name: str, scores: dict) -> tuple:
     """
     Pick the most informative unjudged pair for this judge.
@@ -180,26 +193,22 @@ def select_next_pair(question_ids: list, judge_name: str, scores: dict) -> tuple
     """
     df = load_comparisons()
     judge_df = df[df["judge_name"] == judge_name] if not df.empty else pd.DataFrame()
-
     judged = set()
     if not judge_df.empty:
         judged = {
             frozenset([r.winner_id, r.loser_id])
             for r in judge_df.itertuples()
         }
-
     n = len(question_ids)
     target_pool = min(2000, n * (n - 1) // 2)
     pool = []
     attempts = 0
-
     while len(pool) < target_pool and attempts < 15000:
         i, j = random.sample(range(n), 2)
         pair = frozenset([question_ids[i], question_ids[j]])
         if pair not in judged:
             pool.append((question_ids[i], question_ids[j]))
         attempts += 1
-
     if not pool:
         i, j = random.sample(range(n), 2)
         chosen = (question_ids[i], question_ids[j])
@@ -209,23 +218,17 @@ def select_next_pair(question_ids: list, judge_name: str, scores: dict) -> tuple
         chosen = random.choice(pool[:top_n])
     else:
         chosen = random.choice(pool)
-
     return chosen if random.random() < 0.5 else (chosen[1], chosen[0])
-
-
-# ─── Page: Judging ──────────────────────────────────────────────────────────────────────────────────
-
+# ─── Page: Judging ────────────────────────────────────────────────────────────────────────────────
 def page_judging(question_ids: list):
     st.title("Question Difficulty Ranking")
-
     if not question_ids:
         st.error(
             f"No images found in the `{IMAGES_DIR}/` folder. "
             "Add question images named by their ID (e.g. `Q001.png`) and restart."
         )
         return
-
-    # ── Login ───────────────────────────────────────────────────────────────────────────
+    # ── Login ──────────────────────────────────────────────────────────────────────────────────────
     if not st.session_state.get("judge_name"):
         st.markdown("### Welcome")
         st.markdown(
@@ -239,44 +242,41 @@ def page_judging(question_ids: list):
             st.session_state.pop("current_pair", None)
             st.rerun()
         return
-
     judge = st.session_state["judge_name"]
     done = count_judge_comparisons(judge)
-
-    # ── Sidebar status ──────────────────────────────────────────────────────────────────────
+    # ── Sidebar status ────────────────────────────────────────────────────────────────────────────
     st.sidebar.markdown(f"**Judge:** {judge}")
     st.sidebar.markdown(f"**Comparisons made:** {done} / {TARGET_PER_JUDGE}")
     st.sidebar.progress(min(done / TARGET_PER_JUDGE, 1.0))
-
     if done >= TARGET_PER_JUDGE:
         st.sidebar.success("🎉 Target reached! You can stop or keep going.")
-
     if st.sidebar.button("Switch judge"):
         st.session_state.clear()
         st.rerun()
-
     st.sidebar.markdown("---")
     st.sidebar.caption(
         f"{len(question_ids)} questions loaded. "
         f"Target: {TARGET_PER_JUDGE} comparisons per judge."
     )
-
-    # ── Select next pair ───────────────────────────────────────────────────────────────────────
+    # ── Select next pair ──────────────────────────────────────────────────────────────────────────
     if "current_pair" not in st.session_state:
         scores, _ = compute_rankings(question_ids) if done >= 20 else ({}, {})
         st.session_state["current_pair"] = select_next_pair(
             question_ids, judge, scores
         )
-
     q_left, q_right = st.session_state["current_pair"]
-
-    # ── Comparison UI ──────────────────────────────────────────────────────────────────────────
+    # ── Load flags for this judge (to show already-flagged state) ─────────────────────────────────
+    flags_df = load_flags()
+    flagged_by_judge = set()
+    if not flags_df.empty:
+        flagged_by_judge = set(
+            flags_df[flags_df["judge_name"] == judge]["item_id"].tolist()
+        )
+    # ── Comparison UI ─────────────────────────────────────────────────────────────────────────────
     st.subheader("Which question is more difficult?")
     st.caption("Click the button **below** the question you think is harder.")
     st.markdown("---")
-
     col_l, col_r = st.columns(2, gap="large")
-
     with col_l:
         img_path = get_image_path(q_left)
         if img_path:
@@ -292,7 +292,19 @@ def page_judging(question_ids: list):
             save_comparison(judge, q_left, q_right)
             st.session_state.pop("current_pair", None)
             st.rerun()
-
+        # Flag button — left question
+        if q_left in flagged_by_judge:
+            st.caption("🚩 You've flagged this item as incorrect")
+        else:
+            if st.button(
+                "🚩 Flag as incorrect",
+                key="flag_left",
+                use_container_width=True,
+            ):
+                saved = save_flag(judge, q_left)
+                if saved:
+                    st.toast(f"Flagged: {q_left}", icon="🚩")
+                st.rerun()
     with col_r:
         img_path = get_image_path(q_right)
         if img_path:
@@ -308,40 +320,42 @@ def page_judging(question_ids: list):
             save_comparison(judge, q_right, q_left)
             st.session_state.pop("current_pair", None)
             st.rerun()
-
+        # Flag button — right question
+        if q_right in flagged_by_judge:
+            st.caption("🚩 You've flagged this item as incorrect")
+        else:
+            if st.button(
+                "🚩 Flag as incorrect",
+                key="flag_right",
+                use_container_width=True,
+            ):
+                saved = save_flag(judge, q_right)
+                if saved:
+                    st.toast(f"Flagged: {q_right}", icon="🚩")
+                st.rerun()
     st.markdown("---")
     if st.button("Skip this pair (too close to call)"):
         st.session_state.pop("current_pair", None)
         st.rerun()
-
-
-# ─── Page: Results ──────────────────────────────────────────────────────────────────────────────────
-
+# ─── Page: Results ────────────────────────────────────────────────────────────────────────────────
 def page_results(question_ids: list):
     st.title("Difficulty Rankings")
-
     if not question_ids:
         st.warning("No questions loaded.")
         return
-
     df = load_comparisons()
-
     if df.empty:
         st.info(
             "No comparisons recorded yet. "
             "Come back once judges have completed some decisions."
         )
         return
-
     scores, comp_counts = compute_rankings(question_ids)
-
     if all(v == 0.0 for v in scores.values()):
         st.info("Not enough comparisons yet — complete a few more rounds first.")
         return
-
-    # ── Rankings table ──────────────────────────────────────────────────────────────────────
+    # ── Rankings table ────────────────────────────────────────────────────────────────────────────
     sorted_qs = sorted(scores, key=lambda q: scores[q], reverse=True)
-
     results_df = pd.DataFrame(
         {
             "Rank": range(1, len(sorted_qs) + 1),
@@ -350,9 +364,7 @@ def page_results(question_ids: list):
             "Comparisons": [comp_counts.get(q, 0) for q in sorted_qs],
         }
     )
-
     st.dataframe(results_df, use_container_width=True, hide_index=True)
-
     total = len(df)
     avg_per_item = (total * 2) / max(len(question_ids), 1)
     st.caption(
@@ -361,15 +373,13 @@ def page_results(question_ids: list):
         f"Questions with 0 comparisons: "
         f"**{sum(1 for q in question_ids if comp_counts.get(q, 0) == 0)}**"
     )
-
     st.download_button(
         label="⬇ Download rankings as CSV",
         data=results_df.to_csv(index=False),
         file_name="difficulty_rankings.csv",
         mime="text/csv",
     )
-
-    # ── Per-judge breakdown ──────────────────────────────────────────────────────────────────────────
+    # ── Per-judge breakdown ───────────────────────────────────────────────────────────────────────
     st.subheader("Comparisons per Judge")
     judge_counts = (
         df.groupby("judge_name")
@@ -379,7 +389,6 @@ def page_results(question_ids: list):
         .sort_values("Comparisons", ascending=False)
     )
     st.dataframe(judge_counts, use_container_width=True, hide_index=True)
-
     with st.expander("Download raw comparison data"):
         st.download_button(
             label="⬇ Download all comparisons as CSV",
@@ -387,10 +396,37 @@ def page_results(question_ids: list):
             file_name="raw_comparisons.csv",
             mime="text/csv",
         )
-
-
-# ─── Main ──────────────────────────────────────────────────────────────────────────────────────
-
+    # ── Flagged items ─────────────────────────────────────────────────────────────────────────────
+    st.subheader("🚩 Flagged Items")
+    flags_df = load_flags()
+    if flags_df.empty:
+        st.info("No items have been flagged yet.")
+    else:
+        flag_summary = (
+            flags_df.groupby("item_id")
+            .agg(
+                flag_count=("judge_name", "count"),
+                flagged_by=("judge_name", lambda x: ", ".join(sorted(set(x)))),
+            )
+            .reset_index()
+            .rename(
+                columns={
+                    "item_id": "Item ID",
+                    "flag_count": "Times Flagged",
+                    "flagged_by": "Flagged By",
+                }
+            )
+            .sort_values("Times Flagged", ascending=False)
+        )
+        st.dataframe(flag_summary, use_container_width=True, hide_index=True)
+        with st.expander("Download raw flag data"):
+            st.download_button(
+                label="⬇ Download all flags as CSV",
+                data=flags_df.to_csv(index=False),
+                file_name="raw_flags.csv",
+                mime="text/csv",
+            )
+# ─── Main ─────────────────────────────────────────────────────────────────────────────────────────
 def main():
     st.set_page_config(
         page_title="Difficulty Ranker",
@@ -398,7 +434,6 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded",
     )
-
     try:
         get_client()
     except Exception as e:
@@ -408,17 +443,12 @@ def main():
             f"Error: {e}"
         )
         st.stop()
-
     question_ids = load_question_ids()
-
     st.sidebar.title("📊 Difficulty Ranker")
     page = st.sidebar.radio("Navigation", ["Judge Comparisons", "Results"])
-
     if page == "Judge Comparisons":
         page_judging(question_ids)
     else:
         page_results(question_ids)
-
-
 if __name__ == "__main__":
     main()
