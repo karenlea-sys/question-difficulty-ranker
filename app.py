@@ -278,6 +278,17 @@ def page_judging(question_ids: list):
     st.markdown("---")
     col_l, col_r = st.columns(2, gap="large")
     with col_l:
+        # Flag button — small, top-right of column, above the image
+        if q_left in flagged_by_judge:
+            st.caption("🚩 Already flagged")
+        else:
+            _, flag_col_l = st.columns([4, 1])
+            with flag_col_l:
+                if st.button("🚩 Flag", key="flag_left", help="Flag this question as incorrect"):
+                    saved = save_flag(judge, q_left)
+                    if saved:
+                        st.toast(f"Flagged: {q_left}", icon="🚩")
+                    st.rerun()
         img_path = get_image_path(q_left)
         if img_path:
             st.image(img_path, use_container_width=True)
@@ -292,20 +303,18 @@ def page_judging(question_ids: list):
             save_comparison(judge, q_left, q_right)
             st.session_state.pop("current_pair", None)
             st.rerun()
-        # Flag button — left question
-        if q_left in flagged_by_judge:
-            st.caption("🚩 You've flagged this item as incorrect")
-        else:
-            if st.button(
-                "🚩 Flag as incorrect",
-                key="flag_left",
-                use_container_width=True,
-            ):
-                saved = save_flag(judge, q_left)
-                if saved:
-                    st.toast(f"Flagged: {q_left}", icon="🚩")
-                st.rerun()
     with col_r:
+        # Flag button — small, top-right of column, above the image
+        if q_right in flagged_by_judge:
+            st.caption("🚩 Already flagged")
+        else:
+            _, flag_col_r = st.columns([4, 1])
+            with flag_col_r:
+                if st.button("🚩 Flag", key="flag_right", help="Flag this question as incorrect"):
+                    saved = save_flag(judge, q_right)
+                    if saved:
+                        st.toast(f"Flagged: {q_right}", icon="🚩")
+                    st.rerun()
         img_path = get_image_path(q_right)
         if img_path:
             st.image(img_path, use_container_width=True)
@@ -320,19 +329,6 @@ def page_judging(question_ids: list):
             save_comparison(judge, q_right, q_left)
             st.session_state.pop("current_pair", None)
             st.rerun()
-        # Flag button — right question
-        if q_right in flagged_by_judge:
-            st.caption("🚩 You've flagged this item as incorrect")
-        else:
-            if st.button(
-                "🚩 Flag as incorrect",
-                key="flag_right",
-                use_container_width=True,
-            ):
-                saved = save_flag(judge, q_right)
-                if saved:
-                    st.toast(f"Flagged: {q_right}", icon="🚩")
-                st.rerun()
     st.markdown("---")
     if st.button("Skip this pair (too close to call)"):
         st.session_state.pop("current_pair", None)
