@@ -24,6 +24,14 @@
 #    item_id    text not null,
 #    created_at text not null
 #  );
+#
+#  create table enemy_pairs (
+#    id          text primary key,
+#    item_a      text not null,
+#    item_b      text not null,
+#    reported_by text not null,
+#    created_at  text not null
+#  );
 # ───────────────────────────────────────────────────────────────────────────────
 import os
 import random
@@ -39,6 +47,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 TARGET_PER_JUDGE = 500
 TABLE_NAME = "comparisons"
 FLAGS_TABLE_NAME = "flags"
+ENEMY_PAIRS_TABLE_NAME = "enemy_pairs"
 # ─── Supabase connection ───────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_client() -> Client:
@@ -122,6 +131,48 @@ def save_flag(judge_name: str, item_id: str) -> bool:
     ).execute()
     load_flags.clear()
     return True
+# ─── Data access — enemy pairs ───────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=60)
+def load_enemy_pairs() -> pd.DataFrame:
+    """
+    Read all enemy pairs from Supabase.
+    Enemy pairs are stored in canonical (alphabetical) order so (A,B) == (B,A).
+    Cached for 60 seconds — manually invalidated after writes.
+    """
+    client = get_client()
+    response = client.table(ENEMY_PAIRS_TABLE_NAME).select("*").execute()
+    data = response.data
+    if not data:
+        return pd.DataFrame(
+            columns=["id", "item_a", "item_b", "reported_by", "created_at"]
+        )
+    return pd.DataFrame(data)
+def save_enemy_pair(judge_name: str, item_x: str, item_y: str) -> bool:
+    """
+    Record that two items are too similar to be compared.
+    Stored in canonical alphabetical order so duplicates can be detected.
+    Returns True if saved, False if this pair is already logged.
+    """
+    item_a, item_b = sorted([item_x, item_y])
+    df = load_enemy_pairs()
+    if not df.empty:
+        already = ((df["item_a"] == item_a) & (df["item_b"] == item_b)).any()
+        if already:
+            return False
+    client = get_client()
+    row_id = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S%f") + "_enemy"
+    timestamp = datetime.datetime.utcnow().isoformat()
+    client.table(ENEMY_PAIRS_TABLE_NAME).insert(
+        {
+            "id": row_id,
+            "item_a": item_a,
+            "item_b": item_b,
+            "reported_by": judge_name,
+            "created_at": timestamp,
+        }
+    ).execute()
+    load_enemy_pairs.clear()
+    return True
 # ─── Question loading ──────────────────────────────────────────────────────────────────────────
 @st.cache_data
 def load_question_ids() -> list:
@@ -199,6 +250,15 @@ def select_next_pair(question_ids: list, judge_name: str, scores: dict) -> tuple
             frozenset([r.winner_id, r.loser_id])
             for r in judge_df.itertuples()
         }
+    # Exclude enemy pairs globally — these are too similar to compare for any judge
+    enemy_df = load_enemy_pairs()
+    enemies = set()
+    if not enemy_df.empty:
+        enemies = {
+            frozenset([r.item_a, r.item_b])
+            for r in enemy_df.itertuples()
+        }
+    excluded = judged | enemies
     n = len(question_ids)
     target_pool = min(2000, n * (n - 1) // 2)
     pool = []
@@ -206,7 +266,7 @@ def select_next_pair(question_ids: list, judge_name: str, scores: dict) -> tuple
     while len(pool) < target_pool and attempts < 15000:
         i, j = random.sample(range(n), 2)
         pair = frozenset([question_ids[i], question_ids[j]])
-        if pair not in judged:
+        if pair not in excluded:
             pool.append((question_ids[i], question_ids[j]))
         attempts += 1
     if not pool:
@@ -330,9 +390,33 @@ def page_judging(question_ids: list):
             st.session_state.pop("current_pair", None)
             st.rerun()
     st.markdown("---")
-    if st.button("Skip this pair (too close to call)"):
-        st.session_state.pop("current_pair", None)
-        st.rerun()
+    skip_col, enemy_col = st.columns(2)
+    with skip_col:
+        if st.button(
+            "Too close to call — skip",
+            key="btn_skip",
+            use_container_width=True,
+            help="Move on without recording a judgement. No data saved.",
+        ):
+            st.session_state.pop("current_pair", None)
+            st.rerun()
+    with enemy_col:
+        if st.button(
+            "⚠️ Very similar — shouldn't appear together",
+            key="btn_enemy",
+            use_container_width=True,
+            help="Log these two items as too similar to compare. They won't be paired again for any judge.",
+        ):
+            saved = save_enemy_pair(judge, q_left, q_right)
+            if saved:
+                st.toast(
+                    f"Logged: {q_left} & {q_right} won't be paired again",
+                    icon="⚠️",
+                )
+            else:
+                st.toast("Already logged as too similar to pair", icon="ℹ️")
+            st.session_state.pop("current_pair", None)
+            st.rerun()
 # ─── Page: Results ────────────────────────────────────────────────────────────────────────────────
 def page_results(question_ids: list):
     st.title("Difficulty Rankings")
@@ -420,6 +504,35 @@ def page_results(question_ids: list):
                 label="⬇ Download all flags as CSV",
                 data=flags_df.to_csv(index=False),
                 file_name="raw_flags.csv",
+                mime="text/csv",
+            )
+    # ── Enemy pairs ───────────────────────────────────────────────────────────────────────────────
+    st.subheader("⚠️ Enemy Pairs (too similar to compare)")
+    enemy_df = load_enemy_pairs()
+    if enemy_df.empty:
+        st.info("No enemy pairs have been logged yet.")
+    else:
+        enemy_display = (
+            enemy_df[["item_a", "item_b", "reported_by", "created_at"]]
+            .rename(
+                columns={
+                    "item_a": "Item A",
+                    "item_b": "Item B",
+                    "reported_by": "Reported By",
+                    "created_at": "Logged At",
+                }
+            )
+            .sort_values("Logged At", ascending=False)
+        )
+        st.caption(
+            f"{len(enemy_df)} pair(s) permanently excluded from judging for all judges."
+        )
+        st.dataframe(enemy_display, use_container_width=True, hide_index=True)
+        with st.expander("Download enemy pairs data"):
+            st.download_button(
+                label="⬇ Download enemy pairs as CSV",
+                data=enemy_df.to_csv(index=False),
+                file_name="enemy_pairs.csv",
                 mime="text/csv",
             )
 # ─── Main ─────────────────────────────────────────────────────────────────────────────────────────
