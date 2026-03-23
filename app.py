@@ -36,6 +36,7 @@
 import os
 import random
 import datetime
+import uuid
 from pathlib import Path
 import pandas as pd
 import streamlit as st
@@ -74,9 +75,9 @@ def load_comparisons() -> pd.DataFrame:
 def save_comparison(judge_name: str, winner_id: str, loser_id: str):
     """Insert a comparison row and immediately invalidate the read cache."""
     client = get_client()
-    row_id = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    row_id = str(uuid.uuid4())
     timestamp = datetime.datetime.utcnow().isoformat()
-    client.table(TABLE_NAME).insert(
+    response = client.table(TABLE_NAME).insert(
         {
             "id": row_id,
             "judge_name": judge_name,
@@ -85,8 +86,12 @@ def save_comparison(judge_name: str, winner_id: str, loser_id: str):
             "created_at": timestamp,
         }
     ).execute()
+    if hasattr(response, "error") and response.error:
+        st.error(f"Failed to save comparison: {response.error}")
+        return False
     # Invalidate cached data so the next read reflects this write
     load_comparisons.clear()
+    return True
 def count_judge_comparisons(judge_name: str) -> int:
     df = load_comparisons()
     if df.empty:
@@ -119,9 +124,9 @@ def save_flag(judge_name: str, item_id: str) -> bool:
         if already:
             return False
     client = get_client()
-    row_id = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S%f") + "_flag"
+    row_id = str(uuid.uuid4())
     timestamp = datetime.datetime.utcnow().isoformat()
-    client.table(FLAGS_TABLE_NAME).insert(
+    response = client.table(FLAGS_TABLE_NAME).insert(
         {
             "id": row_id,
             "judge_name": judge_name,
@@ -129,6 +134,9 @@ def save_flag(judge_name: str, item_id: str) -> bool:
             "created_at": timestamp,
         }
     ).execute()
+    if hasattr(response, "error") and response.error:
+        st.error(f"Failed to save flag: {response.error}")
+        return False
     load_flags.clear()
     return True
 # ─── Data access — enemy pairs ───────────────────────────────────────────────────────────────────
@@ -160,9 +168,9 @@ def save_enemy_pair(judge_name: str, item_x: str, item_y: str) -> bool:
         if already:
             return False
     client = get_client()
-    row_id = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S%f") + "_enemy"
+    row_id = str(uuid.uuid4())
     timestamp = datetime.datetime.utcnow().isoformat()
-    client.table(ENEMY_PAIRS_TABLE_NAME).insert(
+    response = client.table(ENEMY_PAIRS_TABLE_NAME).insert(
         {
             "id": row_id,
             "item_a": item_a,
@@ -171,6 +179,9 @@ def save_enemy_pair(judge_name: str, item_x: str, item_y: str) -> bool:
             "created_at": timestamp,
         }
     ).execute()
+    if hasattr(response, "error") and response.error:
+        st.error(f"Failed to save enemy pair: {response.error}")
+        return False
     load_enemy_pairs.clear()
     return True
 # ─── Question loading ──────────────────────────────────────────────────────────────────────────
@@ -360,9 +371,9 @@ def page_judging(question_ids: list):
             use_container_width=True,
             type="primary",
         ):
-            save_comparison(judge, q_left, q_right)
-            st.session_state.pop("current_pair", None)
-            st.rerun()
+            if save_comparison(judge, q_left, q_right):
+                st.session_state.pop("current_pair", None)
+                st.rerun()
     with col_r:
         # Flag button — small, top-right of column, above the image
         if q_right in flagged_by_judge:
@@ -386,9 +397,9 @@ def page_judging(question_ids: list):
             use_container_width=True,
             type="primary",
         ):
-            save_comparison(judge, q_right, q_left)
-            st.session_state.pop("current_pair", None)
-            st.rerun()
+            if save_comparison(judge, q_right, q_left):
+                st.session_state.pop("current_pair", None)
+                st.rerun()
     st.markdown("---")
     skip_col, enemy_col = st.columns(2)
     with skip_col:
