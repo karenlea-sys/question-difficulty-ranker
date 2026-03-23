@@ -247,10 +247,9 @@ def compute_rankings(question_ids: list) -> tuple:
 def select_next_pair(question_ids: list, judge_name: str, scores: dict) -> tuple:
     """
     Pick the most informative unjudged pair for this judge.
-    Samples up to 2,000 candidate pairs, then:
-      - If BT scores exist: picks from the top 10% most informative
-        (closest scores — greatest uncertainty to resolve).
-      - Otherwise: picks randomly.
+    Uses CI-weighted random sampling — questions with wider confidence intervals
+    appear more often, automatically directing effort where the ranking is most
+    uncertain. Falls back to score-proximity selection if CIs not yet available.
     Left/right order is randomised to avoid position bias.
     """
     df = load_comparisons()
@@ -261,7 +260,7 @@ def select_next_pair(question_ids: list, judge_name: str, scores: dict) -> tuple
             frozenset([r.winner_id, r.loser_id])
             for r in judge_df.itertuples()
         }
-    # Exclude enemy pairs globally — these are too similar to compare for any judge
+    # Exclude enemy pairs globally
     enemy_df = load_enemy_pairs()
     enemies = set()
     if not enemy_df.empty:
@@ -283,13 +282,31 @@ def select_next_pair(question_ids: list, judge_name: str, scores: dict) -> tuple
     if not pool:
         i, j = random.sample(range(n), 2)
         chosen = (question_ids[i], question_ids[j])
-    elif scores:
-        pool.sort(key=lambda p: abs(scores.get(p[0], 0.0) - scores.get(p[1], 0.0)))
-        top_n = max(1, len(pool) // 10)
-        chosen = random.choice(pool[:top_n])
     else:
-        chosen = random.choice(pool)
+        # CI-weighted selection: questions with wider CIs appear more often
+        cis = compute_bootstrap_cis(df, tuple(question_ids))
+        if cis:
+            ci_widths = {q: (cis[q][2] - cis[q][0]) for q in cis}
+            # Questions not yet in CIs (too few comparisons) get max weight
+            max_width = max(ci_widths.values(), default=10)
+            weights = [
+                ci_widths.get(a, max_width) + ci_widths.get(b, max_width)
+                for a, b in pool
+            ]
+            total = sum(weights)
+            chosen = (
+                random.choices(pool, weights=weights, k=1)[0]
+                if total > 0 else random.choice(pool)
+            )
+        elif scores:
+            # Fall back to score-proximity if CIs not yet available
+            pool.sort(key=lambda p: abs(scores.get(p[0], 0.0) - scores.get(p[1], 0.0)))
+            top_n = max(1, len(pool) // 10)
+            chosen = random.choice(pool[:top_n])
+        else:
+            chosen = random.choice(pool)
     return chosen if random.random() < 0.5 else (chosen[1], chosen[0])
+
 # ─── Page: Judging ────────────────────────────────────────────────────────────────────────────────
 def page_judging(question_ids: list):
     st.title("Question Difficulty Ranking")
