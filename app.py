@@ -428,7 +428,94 @@ def page_judging(question_ids: list):
                 st.toast("Already logged as too similar to pair", icon="ℹ️")
             st.session_state.pop("current_pair", None)
             st.rerun()
-# ─── Page: Results ────────────────────────────────────────────────────────────────────────────────
+
+# ─── Bootstrap confidence intervals ──────────────────────────────────────────
+
+@st.cache_data(ttl=120)
+def compute_bootstrap_cis(
+    _df: pd.DataFrame, question_ids: tuple, n_resamples: int = 500
+) -> dict:
+    """
+    Bootstrap 95% confidence intervals for each item's rank.
+    Resamples with replacement, re-runs Bradley-Terry, records rank distributions.
+    Returns: question_id -> (rank_lo, rank_median, rank_hi)
+    """
+    import choix
+    import numpy as np
+
+    df = _df
+    q_list = [q for q in question_ids if q in set(df["winner_id"]) | set(df["loser_id"])]
+    if len(q_list) < 2 or df.empty:
+        return {}
+    idx = {q: i for i, q in enumerate(q_list)}
+    data = [
+        (idx[row["winner_id"]], idx[row["loser_id"]])
+        for _, row in df.iterrows()
+        if row["winner_id"] in idx and row["loser_id"] in idx
+    ]
+    if len(data) < 2:
+        return {}
+    rank_lists = {q: [] for q in q_list}
+    rng = np.random.default_rng(42)
+    for _ in range(n_resamples):
+        indices = rng.integers(0, len(data), len(data))
+        sample = [data[i] for i in indices]
+        try:
+            params = choix.ilsr_pairwise(len(q_list), sample, alpha=0.01)
+            order = sorted(range(len(q_list)), key=lambda i: -params[i])
+            for rank, qi in enumerate(order, start=1):
+                rank_lists[q_list[qi]].append(rank)
+        except Exception:
+            continue
+    cis = {}
+    for q in q_list:
+        ranks = sorted(rank_lists[q])
+        if ranks:
+            n = len(ranks)
+            lo  = ranks[max(0, int(0.025 * n))]
+            hi  = ranks[min(n - 1, int(0.975 * n))]
+            med = ranks[n // 2]
+            cis[q] = (lo, med, hi)
+    return cis
+
+
+# ─── Rank stability score ─────────────────────────────────────────────────────
+
+@st.cache_data(ttl=120)
+def compute_stability_score(_df: pd.DataFrame, question_ids: tuple) -> "float | None":
+    """
+    Split-half Spearman correlation as a ranking stability indicator.
+    >= 0.85 = high, 0.70-0.85 = moderate, < 0.70 = low.
+    """
+    import choix
+    import numpy as np
+    from scipy import stats as scipy_stats
+
+    df = _df
+    q_list = [q for q in question_ids if q in set(df["winner_id"]) | set(df["loser_id"])]
+    if len(q_list) < 4 or len(df) < 20:
+        return None
+    idx = {q: i for i, q in enumerate(q_list)}
+    data = [
+        (idx[row["winner_id"]], idx[row["loser_id"]])
+        for _, row in df.iterrows()
+        if row["winner_id"] in idx and row["loser_id"] in idx
+    ]
+    if len(data) < 20:
+        return None
+    rng = np.random.default_rng(99)
+    shuffled = list(data)
+    rng.shuffle(shuffled)
+    mid = len(shuffled) // 2
+    half_a, half_b = shuffled[:mid], shuffled[mid:]
+    try:
+        params_a = choix.ilsr_pairwise(len(q_list), half_a, alpha=0.01)
+        params_b = choix.ilsr_pairwise(len(q_list), half_b, alpha=0.01)
+        corr, _ = scipy_stats.spearmanr(params_a, params_b)
+        return float(corr)
+    except Exception:
+        return None
+
 def page_results(question_ids: list):
     st.title("Difficulty Rankings")
     if not question_ids:
@@ -445,13 +532,48 @@ def page_results(question_ids: list):
     if all(v == 0.0 for v in scores.values()):
         st.info("Not enough comparisons yet — complete a few more rounds first.")
         return
-    # ── Rankings table ────────────────────────────────────────────────────────────────────────────
+
+    # -- Stability score -------------------------------------------------------
+    stability = compute_stability_score(df, tuple(question_ids))
+    if stability is not None:
+        if stability >= 0.85:
+            emoji, verdict = "🟢", "High — top and bottom positions are well settled."
+        elif stability >= 0.70:
+            emoji, verdict = "🟡", "Moderate — direction is sound but middle ranks are uncertain."
+        else:
+            emoji, verdict = "🔴", "Low — more comparisons needed before trusting the ranking."
+        st.metric(
+            label="Ranking Stability (split-half Spearman rho)",
+            value=f"{stability:.2f}",
+            help=(
+                "Compares Bradley-Terry scores from two random halves of all comparisons. "
+                ">= 0.85 = high · 0.70-0.85 = moderate · < 0.70 = low."
+            ),
+        )
+        st.caption(f"{emoji} {verdict}")
+
+    # -- Bootstrap confidence intervals ----------------------------------------
+    with st.spinner("Computing bootstrap confidence intervals..."):
+        cis = compute_bootstrap_cis(df, tuple(question_ids))
+
+    # -- Rankings table --------------------------------------------------------
     sorted_qs = sorted(scores, key=lambda q: scores[q], reverse=True)
+    rank_map = {q: i + 1 for i, q in enumerate(sorted_qs)}
+
+    def ci_str(q: str) -> str:
+        if q not in cis:
+            return "—"
+        lo, _med, hi = cis[q]
+        r = rank_map[q]
+        margin = max(r - lo, hi - r)
+        return f"+/-{margin}" if margin > 0 else "< +/-1"
+
     results_df = pd.DataFrame(
         {
             "Rank": range(1, len(sorted_qs) + 1),
             "Question ID": sorted_qs,
             "Difficulty Score": [round(scores[q], 4) for q in sorted_qs],
+            "95% CI": [ci_str(q) for q in sorted_qs],
             "Comparisons": [comp_counts.get(q, 0) for q in sorted_qs],
         }
     )
@@ -465,12 +587,33 @@ def page_results(question_ids: list):
         f"**{sum(1 for q in question_ids if comp_counts.get(q, 0) == 0)}**"
     )
     st.download_button(
-        label="⬇ Download rankings as CSV",
+        label="Download rankings as CSV",
         data=results_df.to_csv(index=False),
         file_name="difficulty_rankings.csv",
         mime="text/csv",
     )
-    # ── Per-judge breakdown ───────────────────────────────────────────────────────────────────────
+
+    # -- Priority judging list -------------------------------------------------
+    if cis:
+        priority = sorted(
+            [(q, cis[q][2] - cis[q][0]) for q in cis if cis[q][2] > cis[q][0]],
+            key=lambda x: -x[1],
+        )[:10]
+        if priority:
+            with st.expander("Priority judging list — questions with widest CIs"):
+                priority_df = pd.DataFrame({
+                    "Question ID":      [q for q, _ in priority],
+                    "Current Rank":     [rank_map.get(q, "—") for q, _ in priority],
+                    "CI Width (ranks)": [w for _, w in priority],
+                    "Comparisons":      [comp_counts.get(q, 0) for q, _ in priority],
+                })
+                st.dataframe(priority_df, use_container_width=True, hide_index=True)
+                st.caption(
+                    "These questions have the most uncertain rank positions. "
+                    "Prioritising them will tighten the overall ranking fastest."
+                )
+
+    # -- Per-judge breakdown ---------------------------------------------------
     st.subheader("Comparisons per Judge")
     judge_counts = (
         df.groupby("judge_name")
@@ -482,13 +625,14 @@ def page_results(question_ids: list):
     st.dataframe(judge_counts, use_container_width=True, hide_index=True)
     with st.expander("Download raw comparison data"):
         st.download_button(
-            label="⬇ Download all comparisons as CSV",
+            label="Download all comparisons as CSV",
             data=df.to_csv(index=False),
             file_name="raw_comparisons.csv",
             mime="text/csv",
         )
-    # ── Flagged items ─────────────────────────────────────────────────────────────────────────────
-    st.subheader("🚩 Flagged Items")
+
+    # -- Flagged items ---------------------------------------------------------
+    st.subheader("Flagged Items")
     flags_df = load_flags()
     if flags_df.empty:
         st.info("No items have been flagged yet.")
@@ -512,13 +656,14 @@ def page_results(question_ids: list):
         st.dataframe(flag_summary, use_container_width=True, hide_index=True)
         with st.expander("Download raw flag data"):
             st.download_button(
-                label="⬇ Download all flags as CSV",
+                label="Download all flags as CSV",
                 data=flags_df.to_csv(index=False),
                 file_name="raw_flags.csv",
                 mime="text/csv",
             )
-    # ── Enemy pairs ───────────────────────────────────────────────────────────────────────────────
-    st.subheader("⚠️ Enemy Pairs (too similar to compare)")
+
+    # -- Enemy pairs -----------------------------------------------------------
+    st.subheader("Enemy Pairs (too similar to compare)")
     enemy_df = load_enemy_pairs()
     if enemy_df.empty:
         st.info("No enemy pairs have been logged yet.")
@@ -541,7 +686,7 @@ def page_results(question_ids: list):
         st.dataframe(enemy_display, use_container_width=True, hide_index=True)
         with st.expander("Download enemy pairs data"):
             st.download_button(
-                label="⬇ Download enemy pairs as CSV",
+                label="Download enemy pairs as CSV",
                 data=enemy_df.to_csv(index=False),
                 file_name="enemy_pairs.csv",
                 mime="text/csv",
