@@ -65,7 +65,7 @@ def load_comparisons() -> pd.DataFrame:
     Cached for 20 seconds to reduce API calls — manually invalidated after writes.
     """
     client = get_client()
-    response = client.table(TABLE_NAME).select("*").execute()
+    response = client.table(TABLE_NAME).select("*").limit(10000).execute()
     data = response.data
     if not data:
         return pd.DataFrame(
@@ -105,7 +105,7 @@ def load_flags() -> pd.DataFrame:
     Cached for 30 seconds — manually invalidated after writes.
     """
     client = get_client()
-    response = client.table(FLAGS_TABLE_NAME).select("*").execute()
+    response = client.table(FLAGS_TABLE_NAME).select("*").limit(10000).execute()
     data = response.data
     if not data:
         return pd.DataFrame(
@@ -148,7 +148,7 @@ def load_enemy_pairs() -> pd.DataFrame:
     Cached for 60 seconds — manually invalidated after writes.
     """
     client = get_client()
-    response = client.table(ENEMY_PAIRS_TABLE_NAME).select("*").execute()
+    response = client.table(ENEMY_PAIRS_TABLE_NAME).select("*").limit(10000).execute()
     data = response.data
     if not data:
         return pd.DataFrame(
