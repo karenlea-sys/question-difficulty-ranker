@@ -1030,44 +1030,58 @@ def main():
         st.title("Select an Item Set")
         st.markdown("Choose a question set to judge or view results for.")
 
-        # Build overview table
-        overview_rows = []
-        for slug, cfg in ITEM_SETS.items():
+        # One tile per item set, laid out in columns
+        set_items = list(ITEM_SETS.items())
+        cols = st.columns(min(len(set_items), 3), gap="large")
+
+        for i, (slug, cfg) in enumerate(set_items):
             df = load_comparisons(slug)
             total_comps = len(df)
             judge_names = (
-                sorted(df["judge_name"].unique().tolist()) if not df.empty else []
+                sorted(df["judge_name"].unique().tolist())
+                if not df.empty else []
             )
             q_ids = load_question_ids(cfg["images_dir"])
-            overview_rows.append({
-                "Set": cfg["label"],
-                "Questions": len(q_ids),
-                "Total Comparisons": total_comps,
-                "Judges": ", ".join(judge_names) if judge_names else "—",
-                "Status": "Open for judging" if cfg["enabled"] else "Closed",
-                "_slug": slug,
-            })
-        overview_df = pd.DataFrame(overview_rows)
-        st.dataframe(
-            overview_df[["Set", "Questions", "Total Comparisons",
-                         "Judges", "Status"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+            status = "Open" if cfg["enabled"] else "Closed"
 
-        # Selection buttons
-        for slug, cfg in ITEM_SETS.items():
-            label = cfg["label"]
-            if cfg["enabled"]:
-                if st.button(f"Judge: {label}", key=f"select_{slug}",
-                             type="primary"):
-                    st.session_state["item_set"] = slug
-                    st.rerun()
-            # Always allow viewing results
-            if st.button(f"View results: {label}", key=f"results_{slug}"):
-                st.session_state["item_set"] = slug
-                st.session_state["_go_to_results"] = True
-                st.rerun()
+            with cols[i % len(cols)]:
+                with st.container(border=True):
+                    st.subheader(cfg["label"])
+                    st.caption(cfg.get("description", ""))
+
+                    stat_l, stat_r = st.columns(2)
+                    with stat_l:
+                        st.metric("Questions", len(q_ids))
+                    with stat_r:
+                        st.metric("Comparisons", total_comps)
+
+                    st.metric("Judges", len(judge_names) if judge_names else 0)
+                    if judge_names:
+                        st.caption(", ".join(judge_names))
+
+                    st.markdown("---")
+
+                    if cfg["enabled"]:
+                        if st.button(
+                            "Start judging",
+                            key=f"select_{slug}",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            st.session_state["item_set"] = slug
+                            st.rerun()
+
+                    if st.button(
+                        "View results",
+                        key=f"results_{slug}",
+                        use_container_width=True,
+                    ):
+                        st.session_state["item_set"] = slug
+                        st.session_state["_go_to_results"] = True
+                        st.rerun()
+
+                    if not cfg["enabled"]:
+                        st.caption("Judging closed for this set")
 
         return
 
