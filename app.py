@@ -42,13 +42,12 @@ ITEM_SETS = {
         "enabled": True,
         "description": "Original spatial reasoning question set",
     },
-    # Example — uncomment and adjust when the next set is ready:
-    # "figures-v2": {
-    #     "label": "Figures — Set 2",
-    #     "images_dir": "images_v2",
-    #     "enabled": True,
-    #     "description": "Second spatial reasoning question set",
-    # },
+    "folding-and-cutting": {
+        "label": "Folding & Cutting",
+        "images_dir": "images_fc",
+        "enabled": True,
+        "description": "Folding and cutting question set",
+    },
 }
 
 DEFAULT_TARGET = 100          # default personal goal per judge
@@ -294,19 +293,40 @@ def get_image_path(images_dir: str, question_id: str):
 
 def parse_item_metadata(question_id: str) -> dict:
     """
-    Parse metadata from the filename stem.
-    Expected format: item_{number}_{DIFFICULTY}_{ORIENTATION}
-    e.g. item_1.01_EASY_ROTATED  →  batch=1, difficulty=EASY, orientation=ROTATED
+    Parse metadata from the filename stem.  Handles two conventions:
+
+    Figures:           item_1.01_EASY_ROTATED
+                       → batch=1, difficulty=EASY, orientation=ROTATED
+
+    Folding & Cutting: item_1dtf.01_corner_2cuts
+                       → fold_type=1dtf, cut_position=corner, cuts=2
     """
     meta = {
         "batch": "—",
         "difficulty": "—",
         "orientation": "—",
+        "fold_type": "—",
+        "cut_position": "—",
+        "cuts": "—",
         "item_number": question_id,
     }
     parts = question_id.split("_")
-    if len(parts) >= 4 and parts[0] == "item":
-        num_str = parts[1]  # e.g. "1.01"
+    if len(parts) < 3 or parts[0] != "item":
+        return meta
+
+    num_str = parts[1]  # e.g. "1.01" or "1dtf.01"
+
+    # Detect Folding & Cutting format (contains letters in the prefix)
+    prefix = num_str.split(".")[0] if "." in num_str else num_str
+    if any(c.isalpha() for c in prefix):
+        # Folding & Cutting: item_{fold_type}.{num}_{cut_position}_{N}cuts
+        meta["fold_type"] = prefix
+        meta["item_number"] = num_str
+        meta["cut_position"] = parts[2] if len(parts) > 2 else "—"
+        if len(parts) > 3 and parts[3].endswith("cuts"):
+            meta["cuts"] = parts[3].replace("cuts", "")
+    else:
+        # Figures: item_{number}_{DIFFICULTY}_{ORIENTATION}
         meta["item_number"] = num_str
         try:
             meta["batch"] = str(int(float(num_str)))
@@ -314,6 +334,7 @@ def parse_item_metadata(question_id: str) -> dict:
             pass
         meta["difficulty"] = parts[2] if len(parts) > 2 else "—"
         meta["orientation"] = parts[3] if len(parts) > 3 else "—"
+
     return meta
 
 
@@ -850,16 +871,23 @@ def page_results(item_set: str, cfg: dict, question_ids: list):
     rows = []
     for rank, q in enumerate(sorted_qs, 1):
         meta = parse_item_metadata(q)
-        rows.append({
+        row = {
             "Rank": rank,
             "Question ID": q,
             "Difficulty Score": round(scores[q], 4),
             "95% CI": ci_str(q),
             "Comparisons": comp_counts.get(q, 0),
-            "Batch": meta["batch"],
-            "Design Difficulty": meta["difficulty"],
-            "Orientation": meta["orientation"],
-        })
+        }
+        # Add set-appropriate metadata columns
+        if meta["fold_type"] != "—":
+            row["Fold Type"] = meta["fold_type"]
+            row["Cut Position"] = meta["cut_position"]
+            row["Cuts"] = meta["cuts"]
+        else:
+            row["Batch"] = meta["batch"]
+            row["Design Difficulty"] = meta["difficulty"]
+            row["Orientation"] = meta["orientation"]
+        rows.append(row)
     results_df = pd.DataFrame(rows)
 
     st.dataframe(results_df, use_container_width=True, hide_index=True)
