@@ -54,6 +54,12 @@ ITEM_SETS = {
         "enabled": True,
         "description": "Layering composite images question set",
     },
+    "balancing-mobiles": {
+        "label": "Balancing Mobiles",
+        "images_dir": "images_bm",
+        "enabled": True,
+        "description": "Balancing mobiles question set",
+    },
 }
 
 DEFAULT_TARGET = 100          # default personal goal per judge
@@ -322,9 +328,30 @@ def parse_item_metadata(question_id: str) -> dict:
         "layer_type": "—",
         "style": "—",
         "shapes": "—",
+        "bm_batch": "—",
+        "bm_branches": "—",
+        "bm_difficulty": "—",
         "item_number": question_id,
     }
     parts = question_id.split("_")
+
+    # ── Balancing Mobiles format: item{N}bm.{num}_{branches}_{difficulty}
+    #    or item{N}bm.{num}_diff_shape_{branches}_{difficulty} (batch 3)
+    # parts[0] = "item1bm.01", so split on "." to get prefix and item number
+    import re
+    prefix_dot = parts[0].split(".")
+    bm_match = re.match(r'^item(\d)bm$', prefix_dot[0]) if prefix_dot else None
+    if bm_match:
+        meta["bm_batch"] = bm_match.group(1)
+        meta["item_number"] = prefix_dot[1] if len(prefix_dot) > 1 else "—"
+        # batch 3 has extra "diff_shape" tokens: parts = [item3bm.01, diff, shape, 3, 9]
+        if len(parts) >= 5 and parts[1] == "diff" and parts[2] == "shape":
+            meta["bm_branches"] = parts[3]
+            meta["bm_difficulty"] = parts[4]
+        else:
+            meta["bm_branches"] = parts[1] if len(parts) > 1 else "—"
+            meta["bm_difficulty"] = parts[2] if len(parts) > 2 else "—"
+        return meta
 
     # ── Layering format: {prefix}_{number}_{type}_{style}_{sN} ────────
     if len(parts) == 5 and parts[0] in ("lc", "lr", "lu"):
@@ -904,7 +931,11 @@ def page_results(item_set: str, cfg: dict, question_ids: list):
             "Comparisons": comp_counts.get(q, 0),
         }
         # Add set-appropriate metadata columns
-        if meta["layer_prefix"] != "—":
+        if meta["bm_batch"] != "—":
+            row["Batch"] = meta["bm_batch"]
+            row["Branches"] = meta["bm_branches"]
+            row["Design Difficulty"] = meta["bm_difficulty"]
+        elif meta["layer_prefix"] != "—":
             row["Prefix"] = meta["layer_prefix"]
             row["Layer Type"] = meta["layer_type"]
             row["Style"] = meta["style"]
