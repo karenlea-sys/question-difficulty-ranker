@@ -48,6 +48,12 @@ ITEM_SETS = {
         "enabled": True,
         "description": "Folding and cutting question set",
     },
+    "layering": {
+        "label": "Layering",
+        "images_dir": "images_ly",
+        "enabled": True,
+        "description": "Layering composite images question set",
+    },
 }
 
 DEFAULT_TARGET = 100          # default personal goal per judge
@@ -293,13 +299,17 @@ def get_image_path(images_dir: str, question_id: str):
 
 def parse_item_metadata(question_id: str) -> dict:
     """
-    Parse metadata from the filename stem.  Handles two conventions:
+    Parse metadata from the filename stem.  Handles three conventions:
 
     Figures:           item_1.01_EASY_ROTATED
                        → batch=1, difficulty=EASY, orientation=ROTATED
 
     Folding & Cutting: item_1dtf.01_corner_2cuts
                        → fold_type=1dtf, cut_position=corner, cuts=2
+
+    Layering:          lc_001_typ-typ_color_s5
+                       → prefix=lc, item_number=001, layer_type=typ-typ,
+                         style=color, shapes=5
     """
     meta = {
         "batch": "—",
@@ -308,9 +318,24 @@ def parse_item_metadata(question_id: str) -> dict:
         "fold_type": "—",
         "cut_position": "—",
         "cuts": "—",
+        "layer_prefix": "—",
+        "layer_type": "—",
+        "style": "—",
+        "shapes": "—",
         "item_number": question_id,
     }
     parts = question_id.split("_")
+
+    # ── Layering format: {prefix}_{number}_{type}_{style}_{sN} ────────
+    if len(parts) == 5 and parts[0] in ("lc", "lr", "lu"):
+        meta["layer_prefix"] = parts[0]
+        meta["item_number"] = parts[1]
+        meta["layer_type"] = parts[2]
+        meta["style"] = parts[3]
+        meta["shapes"] = parts[4].replace("s", "") if parts[4].startswith("s") else parts[4]
+        return meta
+
+    # ── Figures / Folding & Cutting (item_ prefix) ────────────────────
     if len(parts) < 3 or parts[0] != "item":
         return meta
 
@@ -879,7 +904,12 @@ def page_results(item_set: str, cfg: dict, question_ids: list):
             "Comparisons": comp_counts.get(q, 0),
         }
         # Add set-appropriate metadata columns
-        if meta["fold_type"] != "—":
+        if meta["layer_prefix"] != "—":
+            row["Prefix"] = meta["layer_prefix"]
+            row["Layer Type"] = meta["layer_type"]
+            row["Style"] = meta["style"]
+            row["Shapes"] = meta["shapes"]
+        elif meta["fold_type"] != "—":
             row["Fold Type"] = meta["fold_type"]
             row["Cut Position"] = meta["cut_position"]
             row["Cuts"] = meta["cuts"]
