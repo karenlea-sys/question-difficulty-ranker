@@ -6,12 +6,12 @@
 #
 # Secrets required (Streamlit Cloud → App Settings → Secrets):
 #
-#   [supabase]
-#   url = "https://xxxx.supabase.co"
-#   key = "your-anon-key"
+# [supabase]
+# url = "https://xxxx.supabase.co"
+# key = "your-anon-key"
 #
 # Database migration: run migrate.sql in the Supabase SQL editor before
-# deploying this version.  It adds an `item_set` column to all three tables
+# deploying this version. It adds an `item_set` column to all three tables
 # and tags existing rows as belonging to the first set.
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -28,10 +28,10 @@ from supabase import create_client, Client
 
 
 # ─── Item‑set configuration ──────────────────────────────────────────────────
-# Each key is a unique slug stored in the database.  To add a new set:
-#   1. Create a folder in the repo with the question images.
-#   2. Add an entry below pointing "images_dir" at that folder.
-#   3. Commit — Streamlit auto-redeploys.
+# Each key is a unique slug stored in the database. To add a new set:
+# 1. Create a folder in the repo with the question images.
+# 2. Add an entry below pointing "images_dir" at that folder.
+# 3. Commit — Streamlit auto-redeploys.
 # To disable judging on a set (while keeping its results visible) set
 # "enabled": False.
 
@@ -69,6 +69,8 @@ WARMUP_COUNT = 3              # calibration pairs at the start of a session
 TABLE_COMPARISONS = "comparisons"
 TABLE_FLAGS = "flags"
 TABLE_ENEMY_PAIRS = "enemy_pairs"
+TABLE_EXCLUDED_ITEMS = "excluded_items"
+AUTO_EXCLUDE_FLAG_THRESHOLD = 2
 
 
 # ─── Supabase connection ─────────────────────────────────────────────────────
@@ -94,15 +96,13 @@ def load_comparisons(item_set: str) -> pd.DataFrame:
     data = response.data
     if not data:
         return pd.DataFrame(
-            columns=["id", "judge_name", "winner_id", "loser_id",
-                      "created_at", "item_set"]
+            columns=["id", "judge_name", "winner_id", "loser_id", "created_at", "item_set"]
         )
     return pd.DataFrame(data)
 
 
-def save_comparison(item_set: str, judge_name: str,
-                    winner_id: str, loser_id: str) -> "str | None":
-    """Insert a comparison.  Returns the row ID on success, None on failure."""
+def save_comparison(item_set: str, judge_name: str, winner_id: str, loser_id: str) -> "str | None":
+    """Insert a comparison. Returns the row ID on success, None on failure."""
     # ── Duplicate guard ──────────────────────────────────────────────────
     client = get_client()
     existing = (
@@ -145,11 +145,9 @@ def save_comparison(item_set: str, judge_name: str,
         "created_at": timestamp,
         "item_set": item_set,
     }).execute()
-
     if hasattr(response, "error") and response.error:
         st.error(f"Failed to save comparison: {response.error}")
         return None
-
     load_comparisons.clear()
     return row_id
 
@@ -220,7 +218,6 @@ def save_flag(item_set: str, judge_name: str, item_id: str) -> bool:
         "created_at": timestamp,
         "item_set": item_set,
     }).execute()
-
     if hasattr(response, "error") and response.error:
         st.error(f"Failed to save flag: {response.error}")
         return False
@@ -242,16 +239,13 @@ def load_enemy_pairs(item_set: str) -> pd.DataFrame:
     data = response.data
     if not data:
         return pd.DataFrame(
-            columns=["id", "item_a", "item_b", "reported_by",
-                      "created_at", "item_set"]
+            columns=["id", "item_a", "item_b", "reported_by", "created_at", "item_set"]
         )
     return pd.DataFrame(data)
 
 
-def save_enemy_pair(item_set: str, judge_name: str,
-                    item_x: str, item_y: str) -> bool:
+def save_enemy_pair(item_set: str, judge_name: str, item_x: str, item_y: str) -> bool:
     item_a, item_b = sorted([item_x, item_y])
-
     client = get_client()
     existing = (
         client.table(TABLE_ENEMY_PAIRS)
@@ -275,12 +269,103 @@ def save_enemy_pair(item_set: str, judge_name: str,
         "created_at": timestamp,
         "item_set": item_set,
     }).execute()
-
     if hasattr(response, "error") and response.error:
         st.error(f"Failed to save enemy pair: {response.error}")
         return False
     load_enemy_pairs.clear()
     return True
+
+
+# ─── Data access — excluded items ────────────────────────────────────────────
+@st.cache_data(ttl=30)
+def load_excluded_items(item_set: str) -> pd.DataFrame:
+    """Load manually excluded items from the excluded_items table."""
+    client = get_client()
+    response = (
+        client.table(TABLE_EXCLUDED_ITEMS)
+        .select("*")
+        .eq("item_set", item_set)
+        .limit(10000)
+        .execute()
+    )
+    data = response.data
+    if not data:
+        return pd.DataFrame(
+            columns=["id", "item_id", "item_set", "excluded_by", "reason", "created_at"]
+        )
+    return pd.DataFrame(data)
+
+
+def save_excluded_item(item_set: str, item_id: str, excluded_by: str, reason: str = "") -> bool:
+    """Manually exclude an item. Returns True on success."""
+    client = get_client()
+    existing = (
+        client.table(TABLE_EXCLUDED_ITEMS)
+        .select("id")
+        .eq("item_set", item_set)
+        .eq("item_id", item_id)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        return False  # already excluded
+
+    row_id = str(uuid.uuid4())
+    timestamp = datetime.datetime.utcnow().isoformat()
+    response = client.table(TABLE_EXCLUDED_ITEMS).insert({
+        "id": row_id,
+        "item_id": item_id,
+        "item_set": item_set,
+        "excluded_by": excluded_by,
+        "reason": reason,
+        "created_at": timestamp,
+    }).execute()
+    if hasattr(response, "error") and response.error:
+        st.error(f"Failed to exclude item: {response.error}")
+        return False
+    load_excluded_items.clear()
+    return True
+
+
+def remove_excluded_item(item_set: str, item_id: str) -> bool:
+    """Re-include a manually excluded item. Returns True on success."""
+    client = get_client()
+    response = (
+        client.table(TABLE_EXCLUDED_ITEMS)
+        .delete()
+        .eq("item_set", item_set)
+        .eq("item_id", item_id)
+        .execute()
+    )
+    if hasattr(response, "error") and response.error:
+        st.error(f"Failed to re-include item: {response.error}")
+        return False
+    load_excluded_items.clear()
+    return True
+
+
+def get_excluded_item_ids(item_set: str) -> set:
+    """
+    Get the full set of excluded item IDs for an item set.
+    Combines:
+    - Auto-excluded: items flagged by >= AUTO_EXCLUDE_FLAG_THRESHOLD different judges
+    - Manually excluded: items in the excluded_items table
+    """
+    excluded = set()
+
+    # Auto-exclude from flags
+    flags_df = load_flags(item_set)
+    if not flags_df.empty:
+        flag_counts = flags_df.groupby("item_id")["judge_name"].nunique()
+        auto_excluded = set(flag_counts[flag_counts >= AUTO_EXCLUDE_FLAG_THRESHOLD].index)
+        excluded |= auto_excluded
+
+    # Manual exclusions
+    manual_df = load_excluded_items(item_set)
+    if not manual_df.empty:
+        excluded |= set(manual_df["item_id"].tolist())
+
+    return excluded
 
 
 # ─── Question loading & metadata ─────────────────────────────────────────────
@@ -305,17 +390,10 @@ def get_image_path(images_dir: str, question_id: str):
 
 def parse_item_metadata(question_id: str) -> dict:
     """
-    Parse metadata from the filename stem.  Handles three conventions:
-
-    Figures:           item_1.01_EASY_ROTATED
-                       → batch=1, difficulty=EASY, orientation=ROTATED
-
-    Folding & Cutting: item_1dtf.01_corner_2cuts
-                       → fold_type=1dtf, cut_position=corner, cuts=2
-
-    Layering:          lc_001_typ-typ_color_s5
-                       → prefix=lc, item_number=001, layer_type=typ-typ,
-                         style=color, shapes=5
+    Parse metadata from the filename stem. Handles three conventions:
+    Figures:         item_1.01_EASY_ROTATED → batch=1, difficulty=EASY, orientation=ROTATED
+    Folding & Cutting: item_1dtf.01_corner_2cuts → fold_type=1dtf, cut_position=corner, cuts=2
+    Layering:        lc_001_typ-typ_color_s5 → prefix=lc, item_number=001, layer_type=typ-typ, style=color, shapes=5
     """
     meta = {
         "batch": "—",
@@ -337,7 +415,7 @@ def parse_item_metadata(question_id: str) -> dict:
 
     # ── Balancing Mobiles format: item{N}bm.{num}_{branches}_{difficulty}
     #    or item{N}bm.{num}_diff_shape_{branches}_{difficulty} (batch 3)
-    # parts[0] = "item1bm.01", so split on "." to get prefix and item number
+    #    parts[0] = "item1bm.01", so split on "." to get prefix and item number
     import re
     prefix_dot = parts[0].split(".")
     bm_match = re.match(r'^item(\d)bm$', prefix_dot[0]) if prefix_dot else None
@@ -395,7 +473,6 @@ def compute_rankings(item_set: str, question_ids: list) -> tuple:
     """Returns (scores_dict, comp_counts_dict)."""
     df = load_comparisons(item_set)
     comp_counts = {q: 0 for q in question_ids}
-
     if df.empty:
         return {q: 0.0 for q in question_ids}, comp_counts
 
@@ -416,10 +493,8 @@ def compute_rankings(item_set: str, question_ids: list) -> tuple:
         winners = df["winner_id"].map(idx)
         losers = df["loser_id"].map(idx)
         data = list(zip(winners.tolist(), losers.tolist()))
-
         if len(data) < 2:
             raise ValueError("Not enough data for BT model.")
-
         params = choix.ilsr_pairwise(len(q_list), data, alpha=0.01)
         scores = {q_list[i]: float(params[i]) for i in range(len(q_list))}
     except Exception:
@@ -449,6 +524,7 @@ def compute_bootstrap_cis(
     df = _df
     active = set(df["winner_id"]) | set(df["loser_id"])
     q_list = [q for q in question_ids if q in active]
+
     if len(q_list) < 2 or df.empty:
         return {}
 
@@ -456,8 +532,7 @@ def compute_bootstrap_cis(
     winners = df["winner_id"].map(idx)
     losers = df["loser_id"].map(idx)
     mask = winners.notna() & losers.notna()
-    data = list(zip(winners[mask].astype(int).tolist(),
-                     losers[mask].astype(int).tolist()))
+    data = list(zip(winners[mask].astype(int).tolist(), losers[mask].astype(int).tolist()))
     if len(data) < 2:
         return {}
 
@@ -507,8 +582,7 @@ def compute_stability_score(
     winners = df["winner_id"].map(idx)
     losers = df["loser_id"].map(idx)
     mask = winners.notna() & losers.notna()
-    data = list(zip(winners[mask].astype(int).tolist(),
-                     losers[mask].astype(int).tolist()))
+    data = list(zip(winners[mask].astype(int).tolist(), losers[mask].astype(int).tolist()))
     if len(data) < 20:
         return None
 
@@ -613,35 +687,52 @@ def select_warmup_pair(
     judge_name: str,
 ) -> "tuple | None":
     """
-    For calibration: pick one very‑hard item and one very‑easy item based on
-    existing scores from other judges.  Returns None if not enough data.
+    For calibration: pick one very‑hard item and one very‑easy item
+    based on existing scores from other judges.
+    Returns None if not enough data.
     """
     df = load_comparisons(item_set)
-    if df.empty or len(df) < 20:
+    if df.empty or len(question_ids) < 2:
         return None
 
     scores, _ = compute_rankings(item_set, question_ids)
-    if all(v == 0.0 for v in scores.values()):
+    if not scores or all(v == 0.0 for v in scores.values()):
         return None
 
-    sorted_qs = sorted(scores, key=lambda q: scores[q])
+    # Avoid questions already compared by this judge
+    judge_df = df[df["judge_name"] == judge_name]
+    compared = set()
+    if not judge_df.empty:
+        compared = (
+            set(judge_df["winner_id"]) | set(judge_df["loser_id"])
+        )
 
-    # Pick from the bottom 10 % (easy) and top 10 % (hard)
-    n = len(sorted_qs)
-    easy_pool = sorted_qs[: max(1, n // 10)]
-    hard_pool = sorted_qs[-max(1, n // 10):]
+    available = [q for q in question_ids if q not in compared]
+    if len(available) < 2:
+        return None
 
-    easy = random.choice(easy_pool)
-    hard = random.choice(hard_pool)
+    available_scores = {q: scores.get(q, 0.0) for q in available}
+    easy = min(available_scores, key=available_scores.get)
+    hard = max(available_scores, key=available_scores.get)
     if easy == hard:
         return None
-
     return (easy, hard) if random.random() < 0.5 else (hard, easy)
 
 
 # ─── Page: Judging ────────────────────────────────────────────────────────────
 def page_judging(item_set: str, cfg: dict, question_ids: list):
     images_dir = cfg["images_dir"]
+
+    # ── Filter out excluded items ─────────────────────────────────────────
+    excluded_ids = get_excluded_item_ids(item_set)
+    active_question_ids = [q for q in question_ids if q not in excluded_ids]
+
+    if not active_question_ids:
+        st.error(
+            f"No active questions in this set. "
+            "All questions are either missing or excluded."
+        )
+        return
 
     if not question_ids:
         st.error(
@@ -676,6 +767,7 @@ def page_judging(item_set: str, cfg: dict, question_ids: list):
     # ── Sidebar status ────────────────────────────────────────────────────
     st.sidebar.markdown(f"**Judge:** {judge}")
     st.sidebar.markdown(f"**Item set:** {cfg['label']}")
+
     new_target = st.sidebar.number_input(
         "Your personal target",
         min_value=10,
@@ -690,6 +782,7 @@ def page_judging(item_set: str, cfg: dict, question_ids: list):
 
     st.sidebar.progress(min(done / max(target, 1), 1.0))
     st.sidebar.markdown(f"**{done}** / **{target}** comparisons")
+
     if done >= target:
         st.sidebar.success("Target reached! You can stop or keep going.")
 
@@ -699,7 +792,7 @@ def page_judging(item_set: str, cfg: dict, question_ids: list):
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
-        f"{len(question_ids)} questions in this set."
+        f"{len(active_question_ids)} active questions ({len(excluded_ids)} excluded)"
     )
 
     # ── Main‑area progress bar ────────────────────────────────────────────
@@ -713,7 +806,7 @@ def page_judging(item_set: str, cfg: dict, question_ids: list):
     if "current_pair" not in st.session_state:
         warmup_done = st.session_state.get("warmup_done", 0)
         if warmup_done < WARMUP_COUNT:
-            pair = select_warmup_pair(item_set, question_ids, judge)
+            pair = select_warmup_pair(item_set, active_question_ids, judge)
             if pair:
                 st.session_state["current_pair"] = pair
                 st.session_state["is_warmup"] = True
@@ -721,22 +814,22 @@ def page_judging(item_set: str, cfg: dict, question_ids: list):
                 # Not enough data for warm‑up — go straight to adaptive
                 st.session_state["warmup_done"] = WARMUP_COUNT
                 scores = (
-                    compute_rankings(item_set, question_ids)[0]
+                    compute_rankings(item_set, active_question_ids)[0]
                     if done >= 20
                     else {}
                 )
                 st.session_state["current_pair"] = select_next_pair(
-                    item_set, question_ids, judge, scores
+                    item_set, active_question_ids, judge, scores
                 )
                 st.session_state["is_warmup"] = False
         else:
             scores = (
-                compute_rankings(item_set, question_ids)[0]
+                compute_rankings(item_set, active_question_ids)[0]
                 if done >= 20
                 else {}
             )
             st.session_state["current_pair"] = select_next_pair(
-                item_set, question_ids, judge, scores
+                item_set, active_question_ids, judge, scores
             )
             st.session_state["is_warmup"] = False
 
@@ -757,6 +850,7 @@ def page_judging(item_set: str, cfg: dict, question_ids: list):
             "**Calibration round** — these pairs span a wide difficulty range "
             "to help you get a feel for the set before adaptive selection begins."
         )
+
     st.subheader("Which question is more difficult?")
     st.caption("Click the button **below** the question you think is harder.")
     st.markdown("---")
@@ -769,8 +863,7 @@ def page_judging(item_set: str, cfg: dict, question_ids: list):
         else:
             _, flag_col_l = st.columns([4, 1])
             with flag_col_l:
-                if st.button("Flag", key="flag_left",
-                             help="Flag this question as incorrect"):
+                if st.button("Flag", key="flag_left", help="Flag this question as incorrect"):
                     if save_flag(item_set, judge, q_left):
                         st.toast(f"Flagged: {q_left}", icon="🚩")
                         st.rerun()
@@ -781,8 +874,7 @@ def page_judging(item_set: str, cfg: dict, question_ids: list):
         else:
             st.warning(f"Image not found: {q_left}")
 
-        if st.button("This one is harder", key="btn_left",
-                      use_container_width=True, type="primary"):
+        if st.button("This one is harder", key="btn_left", use_container_width=True, type="primary"):
             row_id = save_comparison(item_set, judge, q_left, q_right)
             if row_id:
                 st.session_state["last_comparison_id"] = row_id
@@ -799,8 +891,7 @@ def page_judging(item_set: str, cfg: dict, question_ids: list):
         else:
             _, flag_col_r = st.columns([4, 1])
             with flag_col_r:
-                if st.button("Flag", key="flag_right",
-                             help="Flag this question as incorrect"):
+                if st.button("Flag", key="flag_right", help="Flag this question as incorrect"):
                     if save_flag(item_set, judge, q_right):
                         st.toast(f"Flagged: {q_right}", icon="🚩")
                         st.rerun()
@@ -811,8 +902,7 @@ def page_judging(item_set: str, cfg: dict, question_ids: list):
         else:
             st.warning(f"Image not found: {q_right}")
 
-        if st.button("This one is harder", key="btn_right",
-                      use_container_width=True, type="primary"):
+        if st.button("This one is harder", key="btn_right", use_container_width=True, type="primary"):
             row_id = save_comparison(item_set, judge, q_right, q_left)
             if row_id:
                 st.session_state["last_comparison_id"] = row_id
@@ -826,7 +916,6 @@ def page_judging(item_set: str, cfg: dict, question_ids: list):
     st.markdown("---")
 
     skip_col, enemy_col, undo_col = st.columns(3)
-
     with skip_col:
         if st.button("Too close to call — skip", key="btn_skip",
                       use_container_width=True,
@@ -835,27 +924,21 @@ def page_judging(item_set: str, cfg: dict, question_ids: list):
             st.rerun()
 
     with enemy_col:
-        if st.button("Very similar — shouldn't appear together",
-                      key="btn_enemy", use_container_width=True,
-                      help="Log these items as too similar. "
-                           "They won't be paired again for any judge."):
-            saved = save_enemy_pair(item_set, judge, q_left, q_right)
-            if saved:
-                st.toast(
-                    f"Logged: {q_left} & {q_right} won't be paired again",
-                    icon="⚠️",
-                )
+        if st.button("Mark as enemies", key="btn_enemy",
+                      use_container_width=True,
+                      help="Mark these two items as too similar to meaningfully compare."):
+            if save_enemy_pair(item_set, judge, q_left, q_right):
+                st.session_state.pop("current_pair", None)
+                st.toast(f"Enemy pair marked: {q_left} ↔ {q_right}", icon="🔗")
+                st.rerun()
             else:
-                st.toast("Already logged as too similar to pair", icon="ℹ️")
-            st.session_state.pop("current_pair", None)
-            st.rerun()
+                st.warning("Enemy pair already marked.")
 
     with undo_col:
         last_id = st.session_state.get("last_comparison_id")
         if last_id:
             if st.button("Undo last comparison", key="btn_undo",
-                          use_container_width=True,
-                          help="Delete your most recent comparison."):
+                          use_container_width=True):
                 if delete_comparison(last_id):
                     st.toast("Last comparison undone", icon="↩️")
                     st.session_state.pop("last_comparison_id", None)
@@ -871,6 +954,14 @@ def page_results(item_set: str, cfg: dict, question_ids: list):
     st.title(f"Difficulty Rankings — {cfg['label']}")
     images_dir = cfg["images_dir"]
 
+    # ── Filter out excluded items ─────────────────────────────────────────
+    excluded_ids = get_excluded_item_ids(item_set)
+    active_question_ids = [q for q in question_ids if q not in excluded_ids]
+
+    if not active_question_ids:
+        st.warning("No active questions in this set.")
+        return
+
     if not question_ids:
         st.warning("No questions loaded.")
         return
@@ -880,13 +971,13 @@ def page_results(item_set: str, cfg: dict, question_ids: list):
         st.info("No comparisons recorded yet.")
         return
 
-    scores, comp_counts = compute_rankings(item_set, question_ids)
+    scores, comp_counts = compute_rankings(item_set, active_question_ids)
     if all(v == 0.0 for v in scores.values()):
         st.info("Not enough comparisons yet — complete a few more rounds first.")
         return
 
     # ── Stability score ───────────────────────────────────────────────────
-    stability = compute_stability_score(df, tuple(question_ids))
+    stability = compute_stability_score(df, tuple(active_question_ids))
     if stability is not None:
         if stability >= 0.85:
             emoji, verdict = "🟢", "High — positions are well settled."
@@ -906,7 +997,7 @@ def page_results(item_set: str, cfg: dict, question_ids: list):
 
     # ── Bootstrap CIs ─────────────────────────────────────────────────────
     with st.spinner("Computing bootstrap confidence intervals..."):
-        cis = compute_bootstrap_cis(df, tuple(question_ids))
+        cis = compute_bootstrap_cis(df, tuple(active_question_ids))
 
     # ── Rankings table with metadata ──────────────────────────────────────
     sorted_qs = sorted(scores, key=lambda q: scores[q], reverse=True)
@@ -949,17 +1040,17 @@ def page_results(item_set: str, cfg: dict, question_ids: list):
             row["Design Difficulty"] = meta["difficulty"]
             row["Orientation"] = meta["orientation"]
         rows.append(row)
-    results_df = pd.DataFrame(rows)
 
+    results_df = pd.DataFrame(rows)
     st.dataframe(results_df, use_container_width=True, hide_index=True)
 
     total = len(df)
-    avg_per_item = (total * 2) / max(len(question_ids), 1)
+    avg_per_item = (total * 2) / max(len(active_question_ids), 1)
     st.caption(
         f"Total comparisons: **{total}** · "
         f"Avg per question: **{avg_per_item:.1f}** · "
         f"Questions with 0 comparisons: "
-        f"**{sum(1 for q in question_ids if comp_counts.get(q, 0) == 0)}**"
+        f"**{sum(1 for q in active_question_ids if comp_counts.get(q, 0) == 0)}**"
     )
 
     st.download_button(
@@ -1008,19 +1099,32 @@ def page_results(item_set: str, cfg: dict, question_ids: list):
             mime="text/csv",
         )
 
-    # ── Flagged items ─────────────────────────────────────────────────────
-    st.subheader("Flagged Items")
+    # ── Excluded items summary ────────────────────────────────────────────
+    if excluded_ids:
+        st.subheader(f"Excluded Items ({len(excluded_ids)})")
+        st.caption(
+            "These items are excluded from pair selection and rankings. "
+            "Review and manage exclusions on the Review Flags page."
+        )
+        excluded_list = sorted(excluded_ids)
+        excluded_df = pd.DataFrame({"Item ID": excluded_list})
+        st.dataframe(excluded_df, use_container_width=True, hide_index=True)
+
+    # ── Flagged items ──────────────────────────────────────────────────────
     flags_df = load_flags(item_set)
-    if flags_df.empty:
-        st.info("No items have been flagged yet.")
-    else:
+    if not flags_df.empty:
+        st.subheader("Flagged Items")
         flag_summary = (
-            flags_df.groupby("item_id")
-            .agg(
-                flag_count=("judge_name", "count"),
-                flagged_by=("judge_name", lambda x: ", ".join(sorted(set(x)))),
-            )
+            flags_df
+            .groupby("item_id")
+            .agg({
+                "judge_name": ["count", lambda x: ", ".join(sorted(set(x)))]
+            })
             .reset_index()
+        )
+        flag_summary.columns = ["item_id", "flag_count", "flagged_by"]
+        flag_summary = (
+            flag_summary
             .rename(columns={
                 "item_id": "Item ID",
                 "flag_count": "Times Flagged",
@@ -1029,6 +1133,7 @@ def page_results(item_set: str, cfg: dict, question_ids: list):
             .sort_values("Times Flagged", ascending=False)
         )
         st.dataframe(flag_summary, use_container_width=True, hide_index=True)
+
         with st.expander("Download raw flag data"):
             st.download_button(
                 label="Download all flags as CSV",
@@ -1057,6 +1162,7 @@ def page_results(item_set: str, cfg: dict, question_ids: list):
             f"{len(enemy_df)} pair(s) permanently excluded from judging."
         )
         st.dataframe(enemy_display, use_container_width=True, hide_index=True)
+
         with st.expander("Download enemy pairs data"):
             st.download_button(
                 label="Download enemy pairs as CSV",
@@ -1064,6 +1170,169 @@ def page_results(item_set: str, cfg: dict, question_ids: list):
                 file_name=f"enemy_pairs_{item_set}.csv",
                 mime="text/csv",
             )
+
+
+# ─── Page: Review Flags ───────────────────────────────────────────────────────
+def page_review_flags(item_set: str, cfg: dict, question_ids: list):
+    st.title(f"Review Flags — {cfg['label']}")
+    images_dir = cfg["images_dir"]
+
+    flags_df = load_flags(item_set)
+    excluded_ids = get_excluded_item_ids(item_set)
+    manual_df = load_excluded_items(item_set)
+    manual_excluded_ids = set(manual_df["item_id"].tolist()) if not manual_df.empty else set()
+
+    # Determine auto-excluded items (flagged by 2+ judges)
+    auto_excluded_ids = set()
+    flag_counts_by_item = {}
+    flagged_by_map = {}
+    if not flags_df.empty:
+        flag_counts_by_item = flags_df.groupby("item_id")["judge_name"].nunique().to_dict()
+        flagged_by_map = flags_df.groupby("item_id")["judge_name"].apply(
+            lambda x: ", ".join(sorted(set(x)))
+        ).to_dict()
+        auto_excluded_ids = {
+            item for item, count in flag_counts_by_item.items()
+            if count >= AUTO_EXCLUDE_FLAG_THRESHOLD
+        }
+
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Flagged", len(flag_counts_by_item))
+    with col2:
+        st.metric("Auto-Excluded (2+ flags)", len(auto_excluded_ids))
+    with col3:
+        st.metric("Manually Excluded", len(manual_excluded_ids - auto_excluded_ids))
+    with col4:
+        st.metric("Total Excluded", len(excluded_ids))
+
+    if not flag_counts_by_item and not manual_excluded_ids:
+        st.info("No items have been flagged or excluded yet.")
+        return
+
+    st.markdown("---")
+
+    # ── Auto-excluded items (2+ flags) ────────────────────────────────────
+    if auto_excluded_ids:
+        st.subheader(f"Auto-Excluded — flagged by 2+ judges ({len(auto_excluded_ids)})")
+        st.caption(
+            "These items were automatically excluded because multiple judges flagged them. "
+            "You can override and re-include them if the flag was unwarranted."
+        )
+        for item_id in sorted(auto_excluded_ids):
+            with st.container(border=True):
+                img_col, info_col, action_col = st.columns([2, 2, 1])
+                with img_col:
+                    img_path = get_image_path(images_dir, item_id)
+                    if img_path:
+                        st.image(img_path, use_container_width=True)
+                    else:
+                        st.warning(f"Image not found: {item_id}")
+                with info_col:
+                    st.markdown(f"**{item_id}**")
+                    st.caption(f"Flagged {flag_counts_by_item.get(item_id, 0)} time(s)")
+                    st.caption(f"By: {flagged_by_map.get(item_id, '—')}")
+                    # Check if also manually excluded
+                    if item_id in manual_excluded_ids:
+                        st.caption("Also manually excluded")
+                with action_col:
+                    # For auto-excluded, offer "Keep excluded" status
+                    st.markdown("**Auto-excluded**")
+                    st.caption("Remove flags to re-include")
+
+    st.markdown("---")
+
+    # ── Single-flag items (need review) ───────────────────────────────────
+    single_flag_items = {
+        item for item, count in flag_counts_by_item.items()
+        if count < AUTO_EXCLUDE_FLAG_THRESHOLD
+    }
+    if single_flag_items:
+        st.subheader(f"Needs Review — flagged once ({len(single_flag_items)})")
+        st.caption(
+            "These items were flagged by a single judge. Review the image and decide "
+            "whether to exclude it from the ranking."
+        )
+        for item_id in sorted(single_flag_items):
+            with st.container(border=True):
+                img_col, info_col, action_col = st.columns([2, 2, 1])
+                with img_col:
+                    img_path = get_image_path(images_dir, item_id)
+                    if img_path:
+                        st.image(img_path, use_container_width=True)
+                    else:
+                        st.warning(f"Image not found: {item_id}")
+                with info_col:
+                    st.markdown(f"**{item_id}**")
+                    st.caption(f"Flagged by: {flagged_by_map.get(item_id, '—')}")
+                    if item_id in manual_excluded_ids:
+                        st.success("Currently excluded")
+                    else:
+                        st.caption("Currently active")
+                with action_col:
+                    if item_id in manual_excluded_ids:
+                        if st.button("Re-include", key=f"include_{item_id}",
+                                     use_container_width=True):
+                            if remove_excluded_item(item_set, item_id):
+                                st.toast(f"Re-included: {item_id}", icon="✅")
+                                st.rerun()
+                    else:
+                        if st.button("Exclude", key=f"exclude_{item_id}",
+                                     use_container_width=True, type="primary"):
+                            if save_excluded_item(item_set, item_id, "admin", "Confirmed flag"):
+                                st.toast(f"Excluded: {item_id}", icon="🚫")
+                                st.rerun()
+
+    st.markdown("---")
+
+    # ── Manually excluded (not flagged) ───────────────────────────────────
+    manual_only = manual_excluded_ids - set(flag_counts_by_item.keys())
+    if manual_only:
+        st.subheader(f"Manually Excluded — not flagged ({len(manual_only)})")
+        st.caption("These items were manually excluded without being flagged by any judge.")
+        for item_id in sorted(manual_only):
+            with st.container(border=True):
+                img_col, info_col, action_col = st.columns([2, 2, 1])
+                with img_col:
+                    img_path = get_image_path(images_dir, item_id)
+                    if img_path:
+                        st.image(img_path, use_container_width=True)
+                    else:
+                        st.warning(f"Image not found: {item_id}")
+                with info_col:
+                    st.markdown(f"**{item_id}**")
+                    # Show who excluded it and when
+                    row = manual_df[manual_df["item_id"] == item_id].iloc[0] if not manual_df.empty else None
+                    if row is not None:
+                        st.caption(f"Excluded by: {row.get('excluded_by', '—')}")
+                        st.caption(f"Reason: {row.get('reason', '—')}")
+                with action_col:
+                    if st.button("Re-include", key=f"include_manual_{item_id}",
+                                 use_container_width=True):
+                        if remove_excluded_item(item_set, item_id):
+                            st.toast(f"Re-included: {item_id}", icon="✅")
+                            st.rerun()
+
+    # ── Bulk exclude by item ID ───────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Manually Exclude an Item")
+    st.caption("Enter an item ID to exclude it from the ranking, even if it hasn't been flagged.")
+    manual_item = st.text_input("Item ID to exclude", key="manual_exclude_input")
+    manual_reason = st.text_input("Reason (optional)", key="manual_exclude_reason")
+    if st.button("Exclude item", key="btn_manual_exclude", type="primary"):
+        if manual_item.strip():
+            item_id = manual_item.strip()
+            if item_id in set(question_ids):
+                if save_excluded_item(item_set, item_id, "admin", manual_reason.strip()):
+                    st.toast(f"Excluded: {item_id}", icon="🚫")
+                    st.rerun()
+                else:
+                    st.warning("Item is already excluded.")
+            else:
+                st.error(f"Item ID '{item_id}' not found in this item set.")
+        else:
+            st.warning("Please enter an item ID.")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -1100,28 +1369,30 @@ def main():
             total_comps = len(df)
             judge_names = (
                 sorted(df["judge_name"].unique().tolist())
-                if not df.empty else []
+                if not df.empty
+                else []
             )
             q_ids = load_question_ids(cfg["images_dir"])
+            excluded = get_excluded_item_ids(slug)
+            active_count = len(q_ids) - len(excluded)
             status = "Open" if cfg["enabled"] else "Closed"
 
             with cols[i % len(cols)]:
                 with st.container(border=True):
                     st.subheader(cfg["label"])
                     st.caption(cfg.get("description", ""))
-
                     stat_l, stat_r = st.columns(2)
                     with stat_l:
-                        st.metric("Questions", len(q_ids))
+                        st.metric("Active Questions", active_count)
+                        if excluded:
+                            st.caption(f"({len(excluded)} excluded)")
                     with stat_r:
                         st.metric("Comparisons", total_comps)
-
                     st.metric("Judges", len(judge_names) if judge_names else 0)
                     if judge_names:
                         st.caption(", ".join(judge_names))
 
                     st.markdown("---")
-
                     if cfg["enabled"]:
                         if st.button(
                             "Start judging",
@@ -1143,7 +1414,6 @@ def main():
 
                     if not cfg["enabled"]:
                         st.caption("Judging closed for this set")
-
         return
 
     # ── Active session ────────────────────────────────────────────────────
@@ -1153,8 +1423,7 @@ def main():
 
     go_to_results = st.session_state.pop("_go_to_results", False)
     default_page = "Results" if go_to_results else "Judge Comparisons"
-
-    pages = ["Judge Comparisons", "Results"] if cfg["enabled"] else ["Results"]
+    pages = ["Judge Comparisons", "Results", "Review Flags"] if cfg["enabled"] else ["Results", "Review Flags"]
     page = st.sidebar.radio(
         "Navigation",
         pages,
@@ -1169,8 +1438,10 @@ def main():
 
     if page == "Judge Comparisons":
         page_judging(item_set, cfg, question_ids)
-    else:
+    elif page == "Results":
         page_results(item_set, cfg, question_ids)
+    else:
+        page_review_flags(item_set, cfg, question_ids)
 
 
 if __name__ == "__main__":
