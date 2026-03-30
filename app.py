@@ -70,7 +70,7 @@ TABLE_COMPARISONS = "comparisons"
 TABLE_FLAGS = "flags"
 TABLE_ENEMY_PAIRS = "enemy_pairs"
 TABLE_EXCLUDED_ITEMS = "excluded_items"
-AUTO_EXCLUDE_FLAG_THRESHOLD = 2
+AUTO_EXCLUDE_FLAG_THRESHOLD = 3
 
 
 # ─── Supabase connection ─────────────────────────────────────────────────────
@@ -349,21 +349,29 @@ def get_excluded_item_ids(item_set: str) -> set:
     Get the full set of excluded item IDs for an item set.
     Combines:
     - Auto-excluded: items flagged by >= AUTO_EXCLUDE_FLAG_THRESHOLD different judges
-    - Manually excluded: items in the excluded_items table
+      (unless overridden via an "override_include" entry in excluded_items)
+    - Manually excluded: items in the excluded_items table (reason != "override_include")
     """
     excluded = set()
+    overrides = set()
 
-    # Auto-exclude from flags
+    # Manual exclusions and overrides
+    manual_df = load_excluded_items(item_set)
+    if not manual_df.empty:
+        overrides = set(
+            manual_df[manual_df["reason"] == "override_include"]["item_id"].tolist()
+        )
+        manual_excluded = set(
+            manual_df[manual_df["reason"] != "override_include"]["item_id"].tolist()
+        )
+        excluded |= manual_excluded
+
+    # Auto-exclude from flags (minus overrides)
     flags_df = load_flags(item_set)
     if not flags_df.empty:
         flag_counts = flags_df.groupby("item_id")["judge_name"].nunique()
         auto_excluded = set(flag_counts[flag_counts >= AUTO_EXCLUDE_FLAG_THRESHOLD].index)
-        excluded |= auto_excluded
-
-    # Manual exclusions
-    manual_df = load_excluded_items(item_set)
-    if not manual_df.empty:
-        excluded |= set(manual_df["item_id"].tolist())
+        excluded |= (auto_excluded - overrides)
 
     return excluded
 
@@ -1180,9 +1188,14 @@ def page_review_flags(item_set: str, cfg: dict, question_ids: list):
     flags_df = load_flags(item_set)
     excluded_ids = get_excluded_item_ids(item_set)
     manual_df = load_excluded_items(item_set)
-    manual_excluded_ids = set(manual_df["item_id"].tolist()) if not manual_df.empty else set()
+    manual_excluded_ids = set(
+        manual_df[manual_df["reason"] != "override_include"]["item_id"].tolist()
+    ) if not manual_df.empty else set()
+    override_included_ids = set(
+        manual_df[manual_df["reason"] == "override_include"]["item_id"].tolist()
+    ) if not manual_df.empty else set()
 
-    # Determine auto-excluded items (flagged by 2+ judges)
+    # Determine auto-excluded items (flagged by 3+ judges)
     auto_excluded_ids = set()
     flag_counts_by_item = {}
     flagged_by_map = {}
@@ -1196,12 +1209,17 @@ def page_review_flags(item_set: str, cfg: dict, question_ids: list):
             if count >= AUTO_EXCLUDE_FLAG_THRESHOLD
         }
 
+    # Items that hit the threshold but have been overridden
+    overridden_ids = auto_excluded_ids & override_included_ids
+    # Items actually excluded by auto-threshold (not overridden)
+    active_auto_excluded = auto_excluded_ids - override_included_ids
+
     # Summary metrics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Total Flagged", len(flag_counts_by_item))
     with col2:
-        st.metric("Auto-Excluded (2+ flags)", len(auto_excluded_ids))
+        st.metric(f"Auto-Excluded ({AUTO_EXCLUDE_FLAG_THRESHOLD}+ flags)", len(active_auto_excluded))
     with col3:
         st.metric("Manually Excluded", len(manual_excluded_ids - auto_excluded_ids))
     with col4:
@@ -1213,14 +1231,15 @@ def page_review_flags(item_set: str, cfg: dict, question_ids: list):
 
     st.markdown("---")
 
-    # ── Auto-excluded items (2+ flags) ────────────────────────────────────
+    # ── Auto-excluded items (3+ flags) ────────────────────────────────────
     if auto_excluded_ids:
-        st.subheader(f"Auto-Excluded — flagged by 2+ judges ({len(auto_excluded_ids)})")
+        st.subheader(f"Auto-Excluded — flagged by {AUTO_EXCLUDE_FLAG_THRESHOLD}+ judges ({len(auto_excluded_ids)})")
         st.caption(
             "These items were automatically excluded because multiple judges flagged them. "
             "You can override and re-include them if the flag was unwarranted."
         )
         for item_id in sorted(auto_excluded_ids):
+            is_overridden = item_id in overridden_ids
             with st.container(border=True):
                 img_col, info_col, action_col = st.columns([2, 2, 1])
                 with img_col:
@@ -1233,13 +1252,23 @@ def page_review_flags(item_set: str, cfg: dict, question_ids: list):
                     st.markdown(f"**{item_id}**")
                     st.caption(f"Flagged {flag_counts_by_item.get(item_id, 0)} time(s)")
                     st.caption(f"By: {flagged_by_map.get(item_id, '—')}")
-                    # Check if also manually excluded
-                    if item_id in manual_excluded_ids:
-                        st.caption("Also manually excluded")
+                    if is_overridden:
+                        st.success("Overridden — currently included")
+                    else:
+                        st.warning("Currently excluded")
                 with action_col:
-                    # For auto-excluded, offer "Keep excluded" status
-                    st.markdown("**Auto-excluded**")
-                    st.caption("Remove flags to re-include")
+                    if is_overridden:
+                        if st.button("Re-exclude", key=f"reexclude_{item_id}",
+                                     use_container_width=True):
+                            remove_excluded_item(item_set, item_id)
+                            st.toast(f"Re-excluded: {item_id}", icon="🚫")
+                            st.rerun()
+                    else:
+                        if st.button("Re-include", key=f"override_{item_id}",
+                                     use_container_width=True, type="primary"):
+                            save_excluded_item(item_set, item_id, "admin", "override_include")
+                            st.toast(f"Override: {item_id} re-included", icon="✅")
+                            st.rerun()
 
     st.markdown("---")
 
@@ -1249,10 +1278,10 @@ def page_review_flags(item_set: str, cfg: dict, question_ids: list):
         if count < AUTO_EXCLUDE_FLAG_THRESHOLD
     }
     if single_flag_items:
-        st.subheader(f"Needs Review — flagged once ({len(single_flag_items)})")
+        st.subheader(f"Needs Review — below auto-exclude threshold ({len(single_flag_items)})")
         st.caption(
-            "These items were flagged by a single judge. Review the image and decide "
-            "whether to exclude it from the ranking."
+            f"These items were flagged fewer than {AUTO_EXCLUDE_FLAG_THRESHOLD} times. "
+            "Review the image and decide whether to exclude it from the ranking."
         )
         for item_id in sorted(single_flag_items):
             with st.container(border=True):
