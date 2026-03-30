@@ -39,7 +39,7 @@ ITEM_SETS = {
     "figures": {
         "label": "Figures",
         "images_dir": "images",
-        "enabled": True,
+        "enabled": False,
         "description": "Original spatial reasoning question set",
     },
     "folding-and-cutting": {
